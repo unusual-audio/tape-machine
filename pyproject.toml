@@ -1,0 +1,35 @@
+[project]
+name = "tape-machine"
+version = "0.1.0"
+description = "A standalone macOS tape machine application."
+authors = [
+    {name = "Unusual Audio",email = "unusualaudio@protonmail.com"}
+]
+requires-python = ">=3.14,<3.15"
+license = "GPL-3.0-or-later"
+license-files = []
+dependencies = [
+    "toga-cocoa>=0.5.5,<0.6.0",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [{include = "tape_machine", from = "src"}]
+
+[tool.poetry.group.dev.dependencies]
+briefcase = ">=0.4.4,<0.5.0"
+
+[tool.briefcase]
+project_name = "Tape Machine"
+bundle = "pkg.unusualaudio"
+
+[tool.briefcase.app.tape-machine]
+formal_name = "Tape Machine"
+description = "A standalone macOS tape machine application."
+sources = ["src/tape_machine"]
+
+[tool.briefcase.app.tape-machine.macOS]
+requires = []
