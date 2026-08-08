@@ -9,6 +9,10 @@ import sounddevice
 
 
 SAMPLE_RATES = (44_100, 48_000, 88_200, 96_000, 176_400, 192_000)
+PROJECT_TRACK_COUNT = 8
+UNASSIGNED_TRACK_INPUTS: tuple[int | None, ...] = (None,) * PROJECT_TRACK_COUNT
+STEREO_BUS_CHANNEL_COUNT = 2
+UNASSIGNED_BUS_OUTPUTS: tuple[int | None, ...] = (None,) * STEREO_BUS_CHANNEL_COUNT
 
 
 class AudioConfigurationError(RuntimeError):
@@ -53,6 +57,19 @@ class AudioDevice:
             f"({channels} {channel_word}, device {self.index})"
         )
 
+    @property
+    def reference(self) -> DeviceReference:
+        """Return the stable descriptor stored in portable project metadata."""
+        return DeviceReference(name=self.name, host_api=self.host_api)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceReference:
+    """Portable audio-device identity independent of PortAudio indices."""
+
+    name: str
+    host_api: str
+
 
 @dataclass(frozen=True, slots=True)
 class AudioSettings:
@@ -61,6 +78,20 @@ class AudioSettings:
     input_device_id: int
     output_device_id: int
     sample_rate: int
+    track_inputs: tuple[int | None, ...] = UNASSIGNED_TRACK_INPUTS
+    bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
+
+    @property
+    def required_input_channels(self) -> int:
+        """Number of leading device channels needed to satisfy the routing."""
+        assigned = [channel for channel in self.track_inputs if channel is not None]
+        return max(assigned, default=-1) + 1
+
+    @property
+    def required_output_channels(self) -> int:
+        """Number of leading device channels needed to satisfy the routing."""
+        assigned = [channel for channel in self.bus_outputs if channel is not None]
+        return max(assigned, default=-1) + 1
 
 
 class AudioDeviceService:
@@ -136,24 +167,41 @@ class AudioDeviceService:
         return self.input_devices, self.output_devices
 
     def supported_sample_rates(
-        self, input_device_id: int, output_device_id: int
+        self,
+        input_device_id: int,
+        output_device_id: int,
+        track_inputs: tuple[int | None, ...] = UNASSIGNED_TRACK_INPUTS,
+        bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS,
     ) -> tuple[int, ...]:
         """Return standard rates accepted by both selected devices."""
-        self._require_device(input_device_id, self.input_devices, "input")
-        self._require_device(output_device_id, self.output_devices, "output")
+        input_device = self._require_device(
+            input_device_id, self.input_devices, "input"
+        )
+        output_device = self._require_device(
+            output_device_id, self.output_devices, "output"
+        )
+        self._validate_track_inputs(track_inputs, input_device)
+        self._validate_bus_outputs(bus_outputs, output_device)
+        required_input_channels = self._available_input_channels(
+            track_inputs, input_device.max_input_channels
+        )
+        required_output_channels = self._available_output_channels(
+            bus_outputs, output_device.max_output_channels
+        )
 
         supported: list[int] = []
         for sample_rate in SAMPLE_RATES:
             try:
-                self._backend.check_input_settings(
-                    device=input_device_id,
-                    channels=1,
-                    dtype="float32",
-                    samplerate=sample_rate,
-                )
+                if required_input_channels:
+                    self._backend.check_input_settings(
+                        device=input_device_id,
+                        channels=required_input_channels,
+                        dtype="float32",
+                        samplerate=sample_rate,
+                    )
                 self._backend.check_output_settings(
                     device=output_device_id,
-                    channels=1,
+                    channels=required_output_channels,
                     dtype="float32",
                     samplerate=sample_rate,
                 )
@@ -182,7 +230,20 @@ class AudioDeviceService:
         if input_device_id is None or output_device_id is None:
             return None
 
-        rates = self.supported_sample_rates(input_device_id, output_device_id)
+        input_device = self.device(input_device_id, "input")
+        output_device = self.device(output_device_id, "output")
+        if input_device is None or output_device is None:
+            return None
+
+        track_inputs = self._suggest_track_inputs(
+            preferred, input_device_id, input_device.max_input_channels
+        )
+        bus_outputs = self._suggest_bus_outputs(
+            preferred, output_device_id, output_device.max_output_channels
+        )
+        rates = self.supported_sample_rates(
+            input_device_id, output_device_id, track_inputs, bus_outputs
+        )
         if not rates:
             return None
 
@@ -193,7 +254,13 @@ class AudioDeviceService:
         else:
             sample_rate = rates[0]
 
-        return AudioSettings(input_device_id, output_device_id, sample_rate)
+        return AudioSettings(
+            input_device_id,
+            output_device_id,
+            sample_rate,
+            track_inputs,
+            bus_outputs,
+        )
 
     def apply(self, settings: AudioSettings) -> None:
         """Validate and activate settings for the remainder of this session."""
@@ -203,27 +270,40 @@ class AudioDeviceService:
 
     def validate(self, settings: AudioSettings) -> None:
         """Validate a complete configuration against the current hardware."""
-        self._require_device(
+        input_device = self._require_device(
             settings.input_device_id, self.input_devices, "input"
         )
-        self._require_device(
+        output_device = self._require_device(
             settings.output_device_id, self.output_devices, "output"
         )
-        if settings.sample_rate not in SAMPLE_RATES:
+        if (
+            not isinstance(settings.sample_rate, int)
+            or isinstance(settings.sample_rate, bool)
+            or settings.sample_rate <= 0
+        ):
             raise AudioConfigurationError(
-                f"{settings.sample_rate} Hz is not an available studio sample rate."
+                f"{settings.sample_rate!r} is not a valid sample rate."
             )
 
+        self._validate_track_inputs(settings.track_inputs, input_device)
+        self._validate_bus_outputs(settings.bus_outputs, output_device)
+
         try:
-            self._backend.check_input_settings(
-                device=settings.input_device_id,
-                channels=1,
-                dtype="float32",
-                samplerate=settings.sample_rate,
+            required_input_channels = self._available_input_channels(
+                settings.track_inputs, input_device.max_input_channels
             )
+            if required_input_channels:
+                self._backend.check_input_settings(
+                    device=settings.input_device_id,
+                    channels=required_input_channels,
+                    dtype="float32",
+                    samplerate=settings.sample_rate,
+                )
             self._backend.check_output_settings(
                 device=settings.output_device_id,
-                channels=1,
+                channels=self._available_output_channels(
+                    settings.bus_outputs, output_device.max_output_channels
+                ),
                 dtype="float32",
                 samplerate=settings.sample_rate,
             )
@@ -239,6 +319,39 @@ class AudioDeviceService:
         return next(
             (device for device in inventory if device.index == device_id), None
         )
+
+    def resolve_device(
+        self, reference: DeviceReference | None, direction: str
+    ) -> AudioDevice | None:
+        """Resolve a stored descriptor, falling back to the system default."""
+        inventory = self.input_devices if direction == "input" else self.output_devices
+        if reference is not None:
+            match = next(
+                (
+                    device
+                    for device in inventory
+                    if device.name == reference.name
+                    and device.host_api == reference.host_api
+                ),
+                None,
+            )
+            if match is not None:
+                return match
+
+        default_id = (
+            self.default_input_device_id
+            if direction == "input"
+            else self.default_output_device_id
+        )
+        return self.device(default_id, direction) if default_id is not None else None
+
+    def compatibility_error(self, settings: AudioSettings) -> str | None:
+        """Return a hardware compatibility message without activating settings."""
+        try:
+            self.validate(settings)
+        except AudioConfigurationError as exc:
+            return str(exc)
+        return None
 
     def _read_backend_defaults(self) -> tuple[int | None, int | None]:
         try:
@@ -268,10 +381,145 @@ class AudioDeviceService:
         return devices[0].index if devices else None
 
     @staticmethod
+    def _suggest_track_inputs(
+        preferred: AudioSettings | None,
+        input_device_id: int,
+        max_input_channels: int,
+    ) -> tuple[int | None, ...]:
+        if (
+            preferred is None
+            or len(preferred.track_inputs) != PROJECT_TRACK_COUNT
+        ):
+            return UNASSIGNED_TRACK_INPUTS
+
+        return tuple(
+            channel
+            if isinstance(channel, int)
+            and not isinstance(channel, bool)
+            and channel >= 0
+            else None
+            for channel in preferred.track_inputs
+        )
+
+    @staticmethod
+    def _required_input_channels(track_inputs: tuple[int | None, ...]) -> int:
+        assigned = [channel for channel in track_inputs if channel is not None]
+        return max(assigned, default=-1) + 1
+
+    @staticmethod
+    def _suggest_bus_outputs(
+        preferred: AudioSettings | None,
+        output_device_id: int,
+        max_output_channels: int,
+    ) -> tuple[int | None, ...]:
+        if (
+            preferred is None
+            or len(preferred.bus_outputs) != STEREO_BUS_CHANNEL_COUNT
+        ):
+            return UNASSIGNED_BUS_OUTPUTS
+
+        outputs: list[int | None] = []
+        used_outputs: set[int] = set()
+        for channel in preferred.bus_outputs:
+            if (
+                isinstance(channel, int)
+                and not isinstance(channel, bool)
+                and channel >= 0
+                and channel not in used_outputs
+            ):
+                outputs.append(channel)
+                used_outputs.add(channel)
+            else:
+                outputs.append(None)
+        return tuple(outputs)
+
+    @staticmethod
+    def _required_output_channels(bus_outputs: tuple[int | None, ...]) -> int:
+        assigned = [channel for channel in bus_outputs if channel is not None]
+        return max(assigned, default=-1) + 1
+
+    @staticmethod
+    def _available_input_channels(
+        track_inputs: tuple[int | None, ...], max_input_channels: int
+    ) -> int:
+        assigned = [
+            channel
+            for channel in track_inputs
+            if channel is not None and channel < max_input_channels
+        ]
+        return max(assigned, default=-1) + 1
+
+    @staticmethod
+    def _available_output_channels(
+        bus_outputs: tuple[int | None, ...], max_output_channels: int
+    ) -> int:
+        assigned = [
+            channel
+            for channel in bus_outputs
+            if channel is not None and channel < max_output_channels
+        ]
+        return max(1, max(assigned, default=-1) + 1)
+
+    @staticmethod
+    def _validate_track_inputs(
+        track_inputs: tuple[int | None, ...], input_device: AudioDevice
+    ) -> None:
+        if len(track_inputs) != PROJECT_TRACK_COUNT:
+            raise AudioConfigurationError(
+                f"Input routing must contain exactly {PROJECT_TRACK_COUNT} tracks."
+            )
+
+        for track_index, channel in enumerate(track_inputs):
+            if channel is None:
+                continue
+            if (
+                not isinstance(channel, int)
+                or isinstance(channel, bool)
+                or channel < 0
+            ):
+                raise AudioConfigurationError(
+                    f"Track {track_index + 1} has invalid input channel "
+                    f"{channel!r}."
+                )
+
+    @staticmethod
+    def _validate_bus_outputs(
+        bus_outputs: tuple[int | None, ...], output_device: AudioDevice
+    ) -> None:
+        if len(bus_outputs) != STEREO_BUS_CHANNEL_COUNT:
+            raise AudioConfigurationError(
+                "Stereo output routing must contain exactly 2 bus channels."
+            )
+
+        used_outputs: set[int] = set()
+        for bus_index, channel in enumerate(bus_outputs):
+            if channel is None:
+                continue
+            bus_side = "L" if bus_index == 0 else "R"
+            if (
+                not isinstance(channel, int)
+                or isinstance(channel, bool)
+                or channel < 0
+            ):
+                raise AudioConfigurationError(
+                    f"Stereo bus {bus_side} has invalid output channel "
+                    f"{channel!r}."
+                )
+            if channel in used_outputs:
+                raise AudioConfigurationError(
+                    "Stereo bus L and R must use distinct output channels."
+                )
+            used_outputs.add(channel)
+
+    @staticmethod
     def _require_device(
         device_id: int, devices: tuple[AudioDevice, ...], direction: str
-    ) -> None:
-        if not any(device.index == device_id for device in devices):
+    ) -> AudioDevice:
+        device = next(
+            (device for device in devices if device.index == device_id), None
+        )
+        if device is None:
             raise AudioConfigurationError(
                 f"Audio {direction} device {device_id} is no longer available."
             )
+        return device
