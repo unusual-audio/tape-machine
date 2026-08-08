@@ -9,6 +9,8 @@ requires-python = ">=3.14,<3.15"
 license = "GPL-3.0-or-later"
 license-files = []
 dependencies = [
+    "sounddevice>=0.5.5,<0.6.0",
+    "soundfile>=0.14.0,<0.15.0",
     "toga-cocoa>=0.5.5,<0.6.0",
 ]
 
@@ -21,6 +23,7 @@ packages = [{include = "tape_machine", from = "src"}]
 
 [tool.poetry.group.dev.dependencies]
 briefcase = ">=0.4.4,<0.5.0"
+pytest = ">=8.4,<9.0"
 
 [tool.briefcase]
 project_name = "Tape Machine"
@@ -33,3 +36,4 @@ sources = ["src/tape_machine"]
 
 [tool.briefcase.app.tape-machine.macOS]
 requires = []
+permission.microphone = "Tape Machine needs microphone access to record audio tracks."
