@@ -1,14 +1,16 @@
 """Tests for the main-window audio summary."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
-from tape_machine.app import TapeMachine
+from tape_machine.app import ShuttleButton, TapeMachine
 from tape_machine.audio import AudioDevice, AudioSettings, DeviceReference
 from tape_machine.engine import AudioEngineError
 from tape_machine.mixer import MixerState
 from tape_machine.project import ProjectMetadata
+from tape_machine.transport import TransportMode
 
 
 class FakeService:
@@ -418,6 +420,7 @@ def test_project_commands_follow_open_project_state() -> None:
         transport=None,
         transport_starting=False,
         transport_stopping=False,
+        momentary_shuttle_task=None,
     )
 
     TapeMachine._update_command_state(app)
@@ -448,11 +451,13 @@ def test_transport_controls_show_toggle_stop_and_time_state() -> None:
     app = SimpleNamespace(
         transport=SimpleNamespace(
             running=True,
+            mode=TransportMode.PLAYING,
             record_armed=True,
             position_frames=60_000,
         ),
         transport_starting=False,
         transport_stopping=False,
+        momentary_shuttle_task=None,
         audio_engine=SimpleNamespace(running=True),
         project=SimpleNamespace(writable=True, sample_rate=48_000),
         transport_record_button=SimpleNamespace(
@@ -461,6 +466,12 @@ def test_transport_controls_show_toggle_stop_and_time_state() -> None:
             style=SimpleNamespace(background_color=None),
         ),
         transport_play_button=SimpleNamespace(enabled=True),
+        transport_rewind_button=SimpleNamespace(
+            enabled=False, active=False
+        ),
+        transport_fast_forward_button=SimpleNamespace(
+            enabled=False, active=False
+        ),
         transport_stop_rtz_button=SimpleNamespace(text="", enabled=False),
         transport_time_label=SimpleNamespace(text=""),
     )
@@ -470,6 +481,240 @@ def test_transport_controls_show_toggle_stop_and_time_state() -> None:
     assert app.transport_record_button.enabled is True
     assert app.transport_record_button.text == "● Record"
     assert app.transport_play_button.enabled is False
+    assert app.transport_rewind_button.enabled is False
+    assert app.transport_fast_forward_button.enabled is False
     assert app.transport_stop_rtz_button.text == "Stop"
     assert app.transport_stop_rtz_button.enabled is True
     assert app.transport_time_label.text == "00:01.250"
+
+
+def test_transport_controls_show_active_fast_forward_state() -> None:
+    app = SimpleNamespace(
+        transport=SimpleNamespace(
+            running=True,
+            mode=TransportMode.FAST_FORWARD,
+            record_armed=False,
+            position_frames=60_000,
+        ),
+        transport_starting=False,
+        transport_stopping=False,
+        momentary_shuttle_task=None,
+        audio_engine=SimpleNamespace(running=True),
+        project=SimpleNamespace(
+            writable=True, sample_rate=48_000, frames=96_000
+        ),
+        transport_record_button=SimpleNamespace(
+            enabled=True,
+            text="",
+            style=SimpleNamespace(background_color=None),
+        ),
+        transport_play_button=SimpleNamespace(enabled=True),
+        transport_rewind_button=SimpleNamespace(
+            enabled=False, active=False
+        ),
+        transport_fast_forward_button=SimpleNamespace(
+            enabled=False, active=False
+        ),
+        transport_stop_rtz_button=SimpleNamespace(text="", enabled=False),
+        transport_time_label=SimpleNamespace(text=""),
+    )
+
+    TapeMachine._sync_transport_controls(app)
+
+    assert app.transport_record_button.enabled is False
+    assert app.transport_play_button.enabled is False
+    assert app.transport_rewind_button.enabled is True
+    assert app.transport_fast_forward_button.enabled is True
+    assert app.transport_fast_forward_button.active is True
+    assert app.transport_rewind_button.active is False
+    assert app.transport_stop_rtz_button.text == "Stop"
+    assert app.transport_time_label.text == "00:01.250"
+
+
+def test_switching_shuttle_direction_stops_before_restarting() -> None:
+    events: list[str] = []
+
+    class FakeTransport:
+        mode = TransportMode.FAST_FORWARD
+
+        @property
+        def running(self) -> bool:
+            return self.mode is not TransportMode.STOPPED
+
+        def rewind(self) -> bool:
+            events.append("rewind")
+            self.mode = TransportMode.REWIND
+            return True
+
+        def fast_forward(self) -> bool:
+            events.append("fast_forward")
+            self.mode = TransportMode.FAST_FORWARD
+            return True
+
+    transport = FakeTransport()
+
+    async def stop_transport() -> None:
+        events.append("stop")
+        transport.mode = TransportMode.STOPPED
+
+    app = SimpleNamespace(
+        transport=transport,
+        audio_engine=SimpleNamespace(running=True),
+        transport_starting=False,
+        transport_stopping=False,
+        mixer_view=None,
+        _stop_transport=stop_transport,
+        _update_command_state=lambda: None,
+        _sync_transport_controls=lambda: None,
+        _schedule_transport_dialog=lambda message: events.append(message),
+    )
+
+    asyncio.run(TapeMachine._toggle_shuttle(app, TransportMode.REWIND))
+
+    assert events == ["stop", "rewind"]
+    assert transport.mode is TransportMode.REWIND
+
+
+def test_clicking_active_shuttle_button_stops_without_restarting() -> None:
+    events: list[str] = []
+    transport = SimpleNamespace(
+        mode=TransportMode.FAST_FORWARD,
+        running=True,
+    )
+
+    async def stop_transport() -> None:
+        events.append("stop")
+        transport.mode = TransportMode.STOPPED
+        transport.running = False
+
+    app = SimpleNamespace(
+        transport=transport,
+        audio_engine=SimpleNamespace(running=True),
+        transport_starting=False,
+        transport_stopping=False,
+        mixer_view=None,
+        _stop_transport=stop_transport,
+    )
+
+    asyncio.run(TapeMachine._toggle_shuttle(app, TransportMode.FAST_FORWARD))
+
+    assert events == ["stop"]
+
+
+def test_shuttle_controls_are_momentary_only_during_safe_playback() -> None:
+    def control_state(record_armed: bool) -> tuple[bool, bool]:
+        app = SimpleNamespace(
+            transport=SimpleNamespace(
+                running=True,
+                mode=TransportMode.PLAYING,
+                record_armed=record_armed,
+                position_frames=48_000,
+            ),
+            transport_starting=False,
+            transport_stopping=False,
+            momentary_shuttle_task=None,
+            audio_engine=SimpleNamespace(running=True),
+            project=SimpleNamespace(
+                writable=True, sample_rate=48_000, frames=96_000
+            ),
+            transport_record_button=SimpleNamespace(
+                enabled=True,
+                text="",
+                style=SimpleNamespace(background_color=None),
+            ),
+            transport_play_button=SimpleNamespace(enabled=True),
+            transport_rewind_button=SimpleNamespace(
+                enabled=False, active=False
+            ),
+            transport_fast_forward_button=SimpleNamespace(
+                enabled=False, active=False
+            ),
+            transport_stop_rtz_button=SimpleNamespace(
+                text="", enabled=False
+            ),
+            transport_time_label=SimpleNamespace(text=""),
+        )
+        TapeMachine._sync_transport_controls(app)
+        return (
+            app.transport_rewind_button.enabled,
+            app.transport_fast_forward_button.enabled,
+        )
+
+    assert control_state(record_armed=False) == (True, True)
+    assert control_state(record_armed=True) == (False, False)
+
+
+def test_momentary_shuttle_resumes_playback_on_release() -> None:
+    events: list[object] = []
+    transport = SimpleNamespace(
+        mode=TransportMode.PLAYING,
+        running=True,
+        record_armed=False,
+        terminal_error=None,
+    )
+    release = asyncio.Event()
+
+    async def stop_transport() -> None:
+        events.append("stop")
+        transport.mode = TransportMode.STOPPED
+        transport.running = False
+
+    async def toggle_shuttle(mode: TransportMode) -> None:
+        events.append(mode)
+        transport.mode = mode
+        transport.running = True
+
+    async def play_transport() -> None:
+        events.append("play")
+        transport.mode = TransportMode.PLAYING
+        transport.running = True
+
+    app = SimpleNamespace(
+        transport=transport,
+        momentary_shuttle_task=None,
+        momentary_shuttle_mode=TransportMode.FAST_FORWARD,
+        momentary_shuttle_release=release,
+        momentary_shuttle_resume=True,
+        _stop_transport=stop_transport,
+        _toggle_shuttle=toggle_shuttle,
+        _play_transport=play_transport,
+        _sync_transport_controls=lambda: None,
+    )
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            TapeMachine._run_momentary_shuttle(
+                app, TransportMode.FAST_FORWARD, release
+            )
+        )
+        app.momentary_shuttle_task = task
+        while transport.mode is not TransportMode.FAST_FORWARD:
+            await asyncio.sleep(0)
+        release.set()
+        await task
+
+    asyncio.run(exercise())
+
+    assert events == [
+        "stop",
+        TransportMode.FAST_FORWARD,
+        "stop",
+        "play",
+    ]
+    assert transport.mode is TransportMode.PLAYING
+
+
+def test_shuttle_button_delivers_release_after_becoming_disabled() -> None:
+    events: list[str] = []
+    button = ShuttleButton(
+        "Rewind",
+        lambda: events.append("press"),
+        lambda: events.append("release"),
+        width=72,
+    )
+
+    button._press(button.widget, 1, 1)
+    button.enabled = False
+    button._release(button.widget, 1, 1)
+
+    assert events == ["press", "release"]

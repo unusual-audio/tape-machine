@@ -42,13 +42,21 @@ changes mark the project as modified and are written to metadata by **Save
 Project**. Saved monitoring becomes active again when the project audio engine
 starts successfully.
 
-The transport provides a record toggle, play, a combined stop/return-to-zero
-button, and a `MM:SS.mmm` position display. With Record active, the transport can
-start and continue rolling without any record-enabled tracks. A routed track's R
-button can be toggled while rolling to punch that track in or out at the next
-audio block. Record can also be toggled while rolling as the master punch control.
-Stopping the transport clears the master Record toggle while leaving individual
-track record-enable buttons armed.
+The transport provides a record toggle, rewind, play, fast-forward, a combined
+stop/return-to-zero button, and a `MM:SS.mmm` position display. From Stop, rewind
+and fast-forward are latched audible shuttle modes: clicking the active button
+stops it, while clicking the opposite button changes direction. During ordinary
+playback they are momentary controls; releasing the button resumes playback from
+the new position. They are disabled whenever global Record is armed. Shuttle
+audio runs backward or forward at 10× speed, is filtered to limit aliasing, is
+reduced by 9 dB, and continues through the mixer. Shuttle stops automatically at
+zero or the end of the project and cannot record.
+
+With Record active, the transport can start and continue rolling without any
+record-enabled tracks. A routed track's R button can be toggled while rolling to
+punch that track in or out at the next audio block. Record can also be toggled
+while rolling as the master punch control. Stopping the transport clears the
+master Record toggle while leaving individual track record-enable buttons armed.
 
 Armed tracks overwrite the corresponding project channels with their raw,
 pre-fader inputs; unarmed tracks are preserved. During a punch, existing audio on

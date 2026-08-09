@@ -7,7 +7,13 @@ import numpy as np
 import pytest
 
 from tape_machine.project import AudioProject, ProjectMetadata
-from tape_machine.transport import TransportController, format_transport_time
+from tape_machine.transport import (
+    SHUTTLE_GAIN,
+    SHUTTLE_SPEED,
+    TransportController,
+    TransportMode,
+    format_transport_time,
+)
 
 
 TRACK_INPUTS = (0, 1, None, None, None, None, None, None)
@@ -94,6 +100,119 @@ def test_playback_reads_tracks_and_stops_at_exact_eof(tmp_path: Path) -> None:
     transport.stop()
     transport.return_to_zero()
     assert transport.position_frames == 0
+    project.close()
+
+
+def test_fast_forward_plays_filtered_audio_at_ten_times_speed(
+    tmp_path: Path,
+) -> None:
+    ramp = np.arange(1000, dtype=np.float32) / 1000
+    audio = np.repeat(ramp[:, np.newaxis], 8, axis=1)
+    project = project_with_audio(tmp_path, audio)
+    transport = TransportController(project)
+    transport.position_frames = 100
+
+    assert transport.fast_forward() is True
+    playback = transport.process_audio(
+        np.zeros((3, 1), np.float32), 3, None
+    )
+
+    assert transport.mode is TransportMode.FAST_FORWARD
+    assert transport.position_frames == 100 + 3 * SHUTTLE_SPEED
+    assert playback[:, 0] == pytest.approx(
+        ramp[[100, 110, 120]] * SHUTTLE_GAIN, abs=2e-5
+    )
+    transport.stop()
+    assert transport.position_frames == 130
+    project.close()
+
+
+def test_rewind_plays_filtered_audio_backwards_at_ten_times_speed(
+    tmp_path: Path,
+) -> None:
+    ramp = np.arange(1000, dtype=np.float32) / 1000
+    audio = np.repeat(ramp[:, np.newaxis], 8, axis=1)
+    project = project_with_audio(tmp_path, audio)
+    transport = TransportController(project)
+    transport.position_frames = 200
+
+    assert transport.rewind() is True
+    playback = transport.process_audio(
+        np.zeros((3, 1), np.float32), 3, None
+    )
+
+    assert transport.mode is TransportMode.REWIND
+    assert transport.position_frames == 200 - 3 * SHUTTLE_SPEED
+    assert playback[:, 0] == pytest.approx(
+        ramp[[199, 189, 179]] * SHUTTLE_GAIN, abs=2e-5
+    )
+    transport.stop()
+    assert transport.position_frames == 170
+    project.close()
+
+
+def test_shuttle_filter_attenuates_source_frequencies_above_new_nyquist(
+    tmp_path: Path,
+) -> None:
+    alternating = np.tile(
+        np.array([-0.5, 0.5], np.float32), 1000
+    )
+    audio = np.repeat(alternating[:, np.newaxis], 8, axis=1)
+    project = project_with_audio(tmp_path, audio)
+    transport = TransportController(project)
+    transport.position_frames = 200
+
+    transport.fast_forward()
+    playback = transport.process_audio(
+        np.zeros((8, 1), np.float32), 8, None
+    )
+
+    assert np.max(np.abs(playback)) < 0.005
+    transport.stop()
+    project.close()
+
+
+def test_shuttle_stops_exactly_at_project_boundaries(tmp_path: Path) -> None:
+    project = project_with_audio(tmp_path, np.ones((25, 8), np.float32) * 0.1)
+    transport = TransportController(project)
+    transport.position_frames = 23
+
+    assert transport.fast_forward() is True
+    transport.process_audio(np.zeros((4, 1), np.float32), 4, None)
+    assert transport.position_frames == 25
+    assert transport.end_requested is True
+    transport.stop()
+    assert transport.fast_forward() is False
+
+    transport.position_frames = 5
+    assert transport.rewind() is True
+    transport.process_audio(np.zeros((4, 1), np.float32), 4, None)
+    assert transport.position_frames == 0
+    assert transport.end_requested is True
+    transport.stop()
+    assert transport.rewind() is False
+    project.close()
+
+
+def test_shuttle_disarms_global_record_without_changing_tracks_or_audio(
+    tmp_path: Path,
+) -> None:
+    original = np.full((100, 8), 0.1, np.float32)
+    project = project_with_audio(tmp_path, original)
+    transport = TransportController(project)
+    armed_tracks = (True, False, True) + (False,) * 5
+    transport.set_armed_tracks(armed_tracks)
+    transport.toggle_record()
+
+    assert transport.fast_forward() is True
+    assert transport.record_armed is False
+    assert transport.armed_tracks == armed_tracks
+    transport.process_audio(np.ones((2, 2), np.float32), 2, None)
+    assert transport._capture_queue.empty()
+    transport.stop()
+    assert project.read_audio_block(0, 100) == pytest.approx(
+        original, abs=1e-6
+    )
     project.close()
 
 

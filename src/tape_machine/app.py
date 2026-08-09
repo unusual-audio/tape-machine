@@ -2,9 +2,11 @@
 
 import asyncio
 from pathlib import Path
+from typing import Callable
 
 import toga
-from toga.style.pack import CENTER, COLUMN, ROW
+from toga.constants import Baseline
+from toga.style.pack import CENTER, COLUMN, ROW, SYSTEM
 
 from tape_machine.audio import (
     AudioConfigurationError,
@@ -18,8 +20,103 @@ from tape_machine.settings import AudioSettingsDraft, AudioSettingsWindow
 from tape_machine.transport import (
     TransportController,
     TransportError,
+    TransportMode,
     format_transport_time,
 )
+
+
+class ShuttleButton:
+    """Canvas-backed transport button with distinct press and release events."""
+
+    def __init__(
+        self,
+        text: str,
+        on_press: Callable[[], None],
+        on_release: Callable[[], None],
+        *,
+        width: int,
+    ) -> None:
+        self.text = text
+        self.width = width
+        self.height = 28
+        self.on_press = on_press
+        self.on_release = on_release
+        self._enabled = True
+        self._active = False
+        self._pointer_down = False
+        self._font = toga.Font(family=SYSTEM, size=11)
+        self.widget = toga.Canvas(
+            width=width,
+            height=self.height,
+            on_resize=self._draw,
+            on_press=self._press,
+            on_release=self._release,
+        )
+        self._draw(self.widget)
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, enabled: bool) -> None:
+        if self._enabled != enabled:
+            self._enabled = enabled
+            self._draw(self.widget)
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @active.setter
+    def active(self, active: bool) -> None:
+        if self._active != active:
+            self._active = active
+            self._draw(self.widget)
+
+    def _press(
+        self, widget: toga.Canvas, x: int, y: int, **kwargs: object
+    ) -> None:
+        if not self._enabled:
+            return
+        self._pointer_down = True
+        self._draw(widget)
+        self.on_press()
+
+    def _release(
+        self, widget: toga.Canvas, x: int, y: int, **kwargs: object
+    ) -> None:
+        if not self._pointer_down:
+            return
+        self._pointer_down = False
+        self._draw(widget)
+        self.on_release()
+
+    def _draw(self, widget: toga.Canvas, **kwargs: object) -> None:
+        widget.root_state.drawing_actions.clear()
+        if self._active or self._pointer_down:
+            background = "#4b8fd9"
+            foreground = "#ffffff"
+        elif self._enabled:
+            background = "#ececec"
+            foreground = "#202020"
+        else:
+            background = "#d8d8d8"
+            foreground = "#888888"
+        with widget.fill(color=background):
+            widget.round_rect(0.5, 0.5, self.width - 1, self.height - 1, 4)
+        with widget.stroke(color="#999999", line_width=1):
+            widget.round_rect(0.5, 0.5, self.width - 1, self.height - 1, 4)
+        text_width, _ = widget.measure_text(self.text, self._font)
+        with widget.fill(color=foreground):
+            widget.fill_text(
+                self.text,
+                (self.width - text_width) / 2,
+                self.height / 2,
+                font=self._font,
+                baseline=Baseline.MIDDLE,
+            )
+        widget.redraw()
 
 
 class TapeMachine(toga.App):
@@ -42,6 +139,10 @@ class TapeMachine(toga.App):
         self.transport_task: asyncio.Task[None] | None = None
         self.transport_starting = False
         self.transport_stopping = False
+        self.momentary_shuttle_mode: TransportMode | None = None
+        self.momentary_shuttle_release: asyncio.Event | None = None
+        self.momentary_shuttle_task: asyncio.Task[None] | None = None
+        self.momentary_shuttle_resume = False
         self.session_audio_settings = self.audio_service.current_settings
         self.project_audio_error: str | None = None
         self.audio_engine_error: str | None = None
@@ -157,6 +258,22 @@ class TapeMachine(toga.App):
             width=60,
             height=28,
         )
+        self.transport_rewind_button = ShuttleButton(
+            "Rewind",
+            on_press=lambda: self._shuttle_pressed(TransportMode.REWIND),
+            on_release=lambda: self._shuttle_released(TransportMode.REWIND),
+            width=72,
+        )
+        self.transport_fast_forward_button = ShuttleButton(
+            "Fast Forward",
+            on_press=lambda: self._shuttle_pressed(
+                TransportMode.FAST_FORWARD
+            ),
+            on_release=lambda: self._shuttle_released(
+                TransportMode.FAST_FORWARD
+            ),
+            width=96,
+        )
         self.transport_stop_rtz_button = toga.Button(
             "RTZ",
             on_press=self._stop_or_rtz,
@@ -175,8 +292,10 @@ class TapeMachine(toga.App):
         transport_bar = toga.Box(
             children=[
                 self.transport_record_button,
+                self.transport_rewind_button.widget,
                 self.transport_play_button,
                 self.transport_stop_rtz_button,
+                self.transport_fast_forward_button.widget,
                 self.transport_time_label,
             ],
             direction=ROW,
@@ -214,7 +333,8 @@ class TapeMachine(toga.App):
     def _update_command_state(self) -> None:
         project_is_open = self.project is not None
         transport_busy = bool(
-            self.transport
+            self.momentary_shuttle_task is not None
+            or self.transport
             and (
                 self.transport.running
                 or self.transport_starting
@@ -419,6 +539,8 @@ class TapeMachine(toga.App):
     ) -> None:
         if self.transport is None or self.project is None:
             return
+        if self.momentary_shuttle_task is not None:
+            return
         if not self.project.writable and not self.transport.record_armed:
             self._schedule_transport_dialog(
                 "This project file is read-only and cannot record."
@@ -448,14 +570,126 @@ class TapeMachine(toga.App):
         self._update_command_state()
         self._sync_transport_controls()
         try:
-            started = await asyncio.to_thread(
+            await asyncio.to_thread(
                 self.transport.play,
                 self.audio_service.current_settings.track_inputs,
                 armed_tracks,
             )
         except TransportError as exc:
             self._schedule_transport_dialog(str(exc))
-            started = False
+        finally:
+            self.transport_starting = False
+            if self.mixer_view is not None:
+                self.mixer_view.set_record_enable_locked(False)
+        self._update_command_state()
+        self._sync_transport_controls()
+
+    def _shuttle_pressed(self, requested_mode: TransportMode) -> None:
+        transport = self.transport
+        if (
+            transport is None
+            or not self.audio_engine.running
+            or self.transport_starting
+            or self.transport_stopping
+            or self.momentary_shuttle_task is not None
+        ):
+            return
+        if transport.mode is TransportMode.PLAYING:
+            if transport.record_armed:
+                return
+            release = asyncio.Event()
+            self.momentary_shuttle_mode = requested_mode
+            self.momentary_shuttle_release = release
+            self.momentary_shuttle_resume = True
+            self.momentary_shuttle_task = asyncio.create_task(
+                self._run_momentary_shuttle(requested_mode, release)
+            )
+            self._sync_transport_controls()
+            return
+        asyncio.create_task(self._toggle_shuttle(requested_mode))
+
+    def _shuttle_released(self, requested_mode: TransportMode) -> None:
+        if self.momentary_shuttle_mode is not requested_mode:
+            return
+        if self.momentary_shuttle_release is not None:
+            self.momentary_shuttle_release.set()
+
+    async def _run_momentary_shuttle(
+        self, requested_mode: TransportMode, release: asyncio.Event
+    ) -> None:
+        transport = self.transport
+        try:
+            if (
+                transport is None
+                or transport.mode is not TransportMode.PLAYING
+                or transport.record_armed
+            ):
+                return
+            await self._stop_transport()
+            if self.transport is not transport:
+                return
+            if transport.terminal_error is not None:
+                return
+            if not release.is_set():
+                await self._toggle_shuttle(requested_mode)
+            await release.wait()
+            if self.transport is not transport:
+                return
+            if transport.mode.shuttling:
+                await self._stop_transport()
+            if (
+                self.momentary_shuttle_resume
+                and transport.terminal_error is None
+            ):
+                await self._play_transport()
+        finally:
+            if self.momentary_shuttle_task is asyncio.current_task():
+                self.momentary_shuttle_mode = None
+                self.momentary_shuttle_release = None
+                self.momentary_shuttle_task = None
+                self.momentary_shuttle_resume = False
+                self._sync_transport_controls()
+
+    async def _end_momentary_shuttle(self) -> None:
+        task = self.momentary_shuttle_task
+        if task is None or task is asyncio.current_task():
+            return
+        self.momentary_shuttle_resume = False
+        if self.momentary_shuttle_release is not None:
+            self.momentary_shuttle_release.set()
+        await task
+
+    async def _toggle_shuttle(self, requested_mode: TransportMode) -> None:
+        if (
+            self.transport is None
+            or not self.audio_engine.running
+            or self.transport_starting
+            or self.transport_stopping
+        ):
+            return
+
+        previous_mode = self.transport.mode
+        if self.transport.running:
+            if not previous_mode.shuttling:
+                return
+            await self._stop_transport()
+            if previous_mode is requested_mode:
+                return
+
+        self.transport_starting = True
+        if self.mixer_view is not None:
+            self.mixer_view.set_record_enable_locked(True)
+        self._update_command_state()
+        self._sync_transport_controls()
+        try:
+            start = (
+                self.transport.rewind
+                if requested_mode is TransportMode.REWIND
+                else self.transport.fast_forward
+            )
+            await asyncio.to_thread(start)
+        except TransportError as exc:
+            self._schedule_transport_dialog(str(exc))
         finally:
             self.transport_starting = False
             if self.mixer_view is not None:
@@ -467,6 +701,9 @@ class TapeMachine(toga.App):
         self, widget: toga.Widget | None = None, **kwargs: object
     ) -> None:
         if self.transport is None:
+            return
+        if self.momentary_shuttle_task is not None:
+            await self._end_momentary_shuttle()
             return
         if self.transport.running:
             await self._stop_transport()
@@ -519,10 +756,15 @@ class TapeMachine(toga.App):
             return
         busy = self.transport_starting or self.transport_stopping
         rolling = self.transport.running
+        mode = self.transport.mode
+        shuttling = mode.shuttling
         engine_available = self.audio_engine.running
+        momentary_shuttle_active = self.momentary_shuttle_task is not None
         self.transport_record_button.enabled = (
             engine_available
             and not busy
+            and not shuttling
+            and not momentary_shuttle_active
             and bool(self.project and self.project.writable)
         )
         if self.transport.record_armed:
@@ -532,11 +774,53 @@ class TapeMachine(toga.App):
             self.transport_record_button.text = "Record"
             del self.transport_record_button.style.background_color
         self.transport_play_button.enabled = (
-            engine_available and not rolling and not busy
+            engine_available
+            and not rolling
+            and not busy
+            and not momentary_shuttle_active
         )
-        self.transport_stop_rtz_button.text = "Stop" if rolling else "RTZ"
+        shuttle_controls_enabled = (
+            engine_available
+            and not busy
+            and not momentary_shuttle_active
+            and (
+                mode is TransportMode.STOPPED
+                or shuttling
+                or (
+                    mode is TransportMode.PLAYING
+                    and not self.transport.record_armed
+                )
+            )
+        )
+        self.transport_rewind_button.enabled = (
+            shuttle_controls_enabled
+            and (
+                shuttling
+                or self.transport.position_frames > 0
+            )
+        )
+        self.transport_fast_forward_button.enabled = (
+            shuttle_controls_enabled
+            and bool(
+                shuttling
+                or self.project
+                and self.transport.position_frames < self.project.frames
+            )
+        )
+        self.transport_rewind_button.active = mode is TransportMode.REWIND
+        self.transport_fast_forward_button.active = (
+            mode is TransportMode.FAST_FORWARD
+        )
+        self.transport_stop_rtz_button.text = (
+            "Stop" if rolling or momentary_shuttle_active else "RTZ"
+        )
         self.transport_stop_rtz_button.enabled = (
-            not busy and (rolling or self.transport.position_frames > 0)
+            not busy
+            and (
+                rolling
+                or momentary_shuttle_active
+                or self.transport.position_frames > 0
+            )
         )
         if self.project is not None:
             self.transport_time_label.text = format_transport_time(
@@ -703,6 +987,7 @@ class TapeMachine(toga.App):
             self.transport.running
             or self.transport_starting
             or self.transport_stopping
+            or self.momentary_shuttle_task is not None
         ):
             return
         if self.project.dirty:
@@ -724,6 +1009,12 @@ class TapeMachine(toga.App):
     def _leave_project(self) -> None:
         self.audio_engine.stop()
         self.audio_engine.set_transport(None)
+        if self.momentary_shuttle_task is not None:
+            self.momentary_shuttle_task.cancel()
+        self.momentary_shuttle_mode = None
+        self.momentary_shuttle_release = None
+        self.momentary_shuttle_task = None
+        self.momentary_shuttle_resume = False
         if self.transport_task is not None:
             self.transport_task.cancel()
         self.transport_task = None
@@ -756,6 +1047,8 @@ class TapeMachine(toga.App):
             return True
         if self.transport_starting or self.transport_stopping:
             return False
+        if self.momentary_shuttle_task is not None:
+            await self._end_momentary_shuttle()
         if self.transport is not None and self.transport.running:
             await self._stop_transport()
         if self.project.dirty:
