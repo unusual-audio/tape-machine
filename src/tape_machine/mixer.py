@@ -10,10 +10,16 @@ import toga
 from toga.style.pack import CENTER, COLUMN, ROW
 
 from tape_machine.audio import PROJECT_TRACK_COUNT
+from tape_machine.project import (
+    MIX_MAX_LEVEL_DB,
+    MIX_MIN_LEVEL_DB,
+    MixerMetadata,
+    TrackMixMetadata,
+)
 
 
-MIN_LEVEL_DB = -60.0
-MAX_LEVEL_DB = 6.0
+MIN_LEVEL_DB = MIX_MIN_LEVEL_DB
+MAX_LEVEL_DB = MIX_MAX_LEVEL_DB
 UNITY_LEVEL_DB = 0.0
 
 _TRACK_STRIP_WIDTH = 88
@@ -49,7 +55,7 @@ def clear_canvas(canvas: toga.Canvas) -> None:
 
 @dataclass(slots=True)
 class TrackMixerState:
-    """Session-only state for one project track strip."""
+    """Live state for one project track strip."""
 
     input_assigned: bool = False
     level_db: float = UNITY_LEVEL_DB
@@ -62,7 +68,7 @@ class TrackMixerState:
 
 @dataclass(slots=True)
 class MixerState:
-    """Session-only state for the eight tracks and stereo bus."""
+    """Live state for the eight tracks and stereo bus."""
 
     tracks: list[TrackMixerState] = field(
         default_factory=lambda: [
@@ -78,9 +84,71 @@ class MixerState:
     def from_track_inputs(
         cls, track_inputs: tuple[int | None, ...]
     ) -> MixerState:
-        state = cls()
-        state.update_input_routes(track_inputs)
-        return state
+        return cls.from_metadata(track_inputs, MixerMetadata())
+
+    @classmethod
+    def from_metadata(
+        cls,
+        track_inputs: tuple[int | None, ...],
+        mix: MixerMetadata,
+    ) -> MixerState:
+        """Restore persisted controls and derive input availability from routes."""
+        if len(track_inputs) != PROJECT_TRACK_COUNT:
+            raise ValueError(
+                f"Mixer routing must contain {PROJECT_TRACK_COUNT} tracks."
+            )
+        tracks = []
+        for channel, saved in zip(track_inputs, mix.tracks, strict=True):
+            input_assigned = channel is not None
+            tracks.append(
+                TrackMixerState(
+                    input_assigned=input_assigned,
+                    level_db=saved.level_db,
+                    pan=saved.pan,
+                    record_enabled=(
+                        saved.record_enabled if input_assigned else False
+                    ),
+                    input_monitoring=(
+                        saved.input_monitoring if input_assigned else False
+                    ),
+                    muted=saved.muted,
+                    soloed=saved.soloed,
+                )
+            )
+        return cls(tracks=tracks, bus_level_db=mix.bus_level_db)
+
+    def to_metadata(
+        self, track_inputs: tuple[int | None, ...] | None = None
+    ) -> MixerMetadata:
+        """Snapshot controls, normalizing input-only states for absent routes."""
+        if track_inputs is not None and len(track_inputs) != PROJECT_TRACK_COUNT:
+            raise ValueError(
+                f"Mixer routing must contain {PROJECT_TRACK_COUNT} tracks."
+            )
+        saved_tracks = []
+        for index, track in enumerate(self.tracks):
+            input_assigned = (
+                track.input_assigned
+                if track_inputs is None
+                else track_inputs[index] is not None
+            )
+            saved_tracks.append(
+                TrackMixMetadata(
+                    level_db=track.level_db,
+                    pan=track.pan,
+                    record_enabled=(
+                        track.record_enabled if input_assigned else False
+                    ),
+                    input_monitoring=(
+                        track.input_monitoring if input_assigned else False
+                    ),
+                    muted=track.muted,
+                    soloed=track.soloed,
+                )
+            )
+        return MixerMetadata(
+            tracks=tuple(saved_tracks), bus_level_db=self.bus_level_db
+        )
 
     def update_input_routes(
         self, track_inputs: tuple[int | None, ...]
@@ -320,7 +388,7 @@ class TrackStrip:
         self.mixer_state = mixer_state
         self.state = mixer_state.tracks[index]
         self.monitoring_available = False
-        self.transport_running = False
+        self.record_enable_locked = False
         self.pan = PanKnob(
             self.state.pan,
             lambda value: self.mixer_state.set_pan(self.index, value),
@@ -400,7 +468,7 @@ class TrackStrip:
         for control, button in self.buttons.items():
             if control == "record_enabled":
                 button.enabled = (
-                    self.state.input_assigned and not self.transport_running
+                    self.state.input_assigned and not self.record_enable_locked
                 )
             elif control == "input_monitoring":
                 button.enabled = (
@@ -489,14 +557,12 @@ class MixerView:
 
     def set_monitoring_available(self, available: bool) -> None:
         """Enable monitor controls only while an audio stream is running."""
-        if not available:
-            self.state.clear_monitoring()
         for strip in self.track_strips:
             strip.monitoring_available = available
             strip.sync_controls()
 
-    def set_transport_running(self, running: bool) -> None:
-        """Lock record-enable targets for the duration of a transport run."""
+    def set_record_enable_locked(self, locked: bool) -> None:
+        """Lock record-enable controls during transport state transitions."""
         for strip in self.track_strips:
-            strip.transport_running = running
+            strip.record_enable_locked = locked
             strip.sync_controls()

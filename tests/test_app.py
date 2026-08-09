@@ -80,10 +80,19 @@ class FakeProject:
         reference = DeviceReference("Interface", "Test API")
         self.metadata = ProjectMetadata(reference, reference)
         self.saved: list[ProjectMetadata] = []
+        self.staged: list[ProjectMetadata] = []
+        self.dirty = False
 
     def save(self, metadata: ProjectMetadata) -> None:
         self.saved.append(metadata)
         self.metadata = metadata
+        self.dirty = False
+
+    def stage_metadata(self, metadata: ProjectMetadata) -> None:
+        self.staged.append(metadata)
+        if metadata != self.metadata:
+            self.metadata = metadata
+            self.dirty = True
 
 
 def summary_app(settings: AudioSettings | None) -> SimpleNamespace:
@@ -206,9 +215,23 @@ def test_status_line_marks_project_audio_engine_failure() -> None:
 
 def test_mixer_change_rebuilds_running_engine_matrix() -> None:
     calls: list[object] = []
-    state = object()
+    arm_calls: list[tuple[bool, ...]] = []
+    routes = (None, None, 2, None, None, None, None, None)
+    state = MixerState.from_track_inputs(routes)
+    state.tracks[2].record_enabled = True
+    project = FakeProject()
+    project.metadata = project.metadata.with_audio(
+        project.metadata.input_device,
+        project.metadata.output_device,
+        routes,
+        (0, 1),
+    )
     app = SimpleNamespace(
         mixer_state=state,
+        project=project,
+        transport=SimpleNamespace(
+            set_armed_tracks=lambda armed: arm_calls.append(armed)
+        ),
         audio_engine=SimpleNamespace(
             running=True,
             update_mix=lambda mixer_state: calls.append(mixer_state),
@@ -218,6 +241,9 @@ def test_mixer_change_rebuilds_running_engine_matrix() -> None:
     TapeMachine._mixer_changed(app)
 
     assert calls == [state]
+    assert arm_calls == [(False, False, True, False, False, False, False, False)]
+    assert project.dirty is True
+    assert project.staged[-1].mix.tracks[2].record_enabled is True
 
 
 def test_audio_failure_stops_engine_and_disables_monitoring() -> None:
@@ -251,12 +277,16 @@ def test_project_audio_settings_commit_after_stream_starts() -> None:
     service = FakeService(old_settings)
     engine = FakeLifecycleEngine()
     project = FakeProject()
+    mixer_state = MixerState()
+    mixer_state.tracks[0].level_db = -8.0
+    mixer_state.tracks[0].muted = True
+    mixer_state.bus_level_db = -3.0
     view_events: list[object] = []
     app = SimpleNamespace(
         project=project,
         audio_service=service,
         audio_engine=engine,
-        mixer_state=MixerState(),
+        mixer_state=mixer_state,
         mixer_view=SimpleNamespace(
             update_track_routes=lambda routes: view_events.append(routes),
             set_monitoring_available=lambda available: view_events.append(
@@ -273,10 +303,51 @@ def test_project_audio_settings_commit_after_stream_starts() -> None:
     assert engine.stop_calls == 1
     assert engine.starts == [new_settings]
     assert project.saved[0].track_inputs == new_settings.track_inputs
+    assert project.saved[0].mix.tracks[0].level_db == -8.0
+    assert project.saved[0].mix.tracks[0].muted is True
+    assert project.saved[0].mix.bus_level_db == -3.0
     assert service.current_settings == new_settings
     assert app.project_audio_error is None
     assert app.audio_engine_error is None
     assert view_events == [new_settings.track_inputs, True, "summary"]
+
+
+def test_project_audio_settings_clear_input_states_for_removed_route() -> None:
+    old_settings = AudioSettings(
+        1,
+        1,
+        48_000,
+        (0,) + (None,) * 7,
+        (0, 1),
+    )
+    new_settings = AudioSettings(1, 1, 48_000, (None,) * 8, (0, 1))
+    service = FakeService(old_settings)
+    engine = FakeLifecycleEngine()
+    project = FakeProject()
+    state = MixerState.from_track_inputs(old_settings.track_inputs)
+    state.tracks[0].record_enabled = True
+    state.tracks[0].input_monitoring = True
+    state.tracks[0].muted = True
+    app = SimpleNamespace(
+        project=project,
+        audio_service=service,
+        audio_engine=engine,
+        mixer_state=state,
+        mixer_view=SimpleNamespace(
+            update_track_routes=lambda routes: None,
+            set_monitoring_available=lambda available: None,
+        ),
+        project_audio_error=None,
+        audio_engine_error=None,
+        _update_audio_summary=lambda: None,
+    )
+
+    TapeMachine._project_audio_settings_applied(app, new_settings)
+
+    saved_track = project.saved[0].mix.tracks[0]
+    assert saved_track.record_enabled is False
+    assert saved_track.input_monitoring is False
+    assert saved_track.muted is True
 
 
 def test_saving_unchanged_project_settings_keeps_active_stream() -> None:

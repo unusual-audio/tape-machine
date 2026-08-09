@@ -7,11 +7,7 @@ import numpy as np
 import pytest
 
 from tape_machine.project import AudioProject, ProjectMetadata
-from tape_machine.transport import (
-    TransportController,
-    TransportError,
-    format_transport_time,
-)
+from tape_machine.transport import TransportController, format_transport_time
 
 
 TRACK_INPUTS = (0, 1, None, None, None, None, None, None)
@@ -32,15 +28,51 @@ def test_transport_time_is_minutes_seconds_and_milliseconds() -> None:
     assert format_transport_time(48_000 * 6_001, 48_000) == "100:01.000"
 
 
-def test_record_requires_at_least_one_record_enabled_track(
+def test_global_record_rolls_with_no_record_enabled_tracks(
+    tmp_path: Path,
+) -> None:
+    original = np.full((1, 8), 0.1, np.float32)
+    project = project_with_audio(tmp_path, original)
+    transport = TransportController(project)
+    transport.toggle_record()
+
+    assert transport.play(TRACK_INPUTS, (False,) * 8) is True
+    playback = transport.process_audio(np.zeros((2, 2), np.float32), 2, None)
+
+    assert playback[0] == pytest.approx(original[0], abs=1e-6)
+    assert not playback[1].any()
+    assert transport.position_frames == 2
+    assert transport.end_requested is False
+    transport.stop()
+    assert transport.record_armed is False
+    assert transport.armed_tracks == (False,) * 8
+    assert project.frames == 1
+
+    project.close()
+
+
+def test_stop_disarms_global_record_but_preserves_track_record_enables(
     tmp_path: Path,
 ) -> None:
     project = project_with_audio(tmp_path, np.zeros((1, 8), np.float32))
     transport = TransportController(project)
+    armed_tracks = (True, False, True) + (False,) * 5
     transport.toggle_record()
 
-    with pytest.raises(TransportError, match="Record-enable"):
-        transport.play(TRACK_INPUTS, (False,) * 8)
+    assert transport.play(TRACK_INPUTS, armed_tracks) is True
+    transport.stop()
+
+    assert transport.record_armed is False
+    assert transport.armed_tracks == armed_tracks
+    project.close()
+
+
+def test_play_at_eof_without_global_record_does_not_roll(tmp_path: Path) -> None:
+    project = project_with_audio(tmp_path, np.zeros((1, 8), np.float32))
+    transport = TransportController(project)
+    transport.position_frames = 1
+
+    assert transport.play(TRACK_INPUTS, (False,) * 8) is False
 
     project.close()
 
@@ -144,4 +176,82 @@ def test_record_toggle_punches_out_while_transport_keeps_rolling(
     assert after_punch[:, 0] == pytest.approx(original[4:, 0], abs=1e-6)
     assert recorded[:4, 0] == pytest.approx([0.5] * 4, abs=1e-6)
     assert recorded[4:, 0] == pytest.approx(original[4:, 0], abs=1e-6)
+    project.close()
+
+
+def test_track_record_enable_can_punch_between_tracks_while_rolling(
+    tmp_path: Path,
+) -> None:
+    original = np.full((12, 8), 0.1, dtype=np.float32)
+    project = project_with_audio(tmp_path, original)
+    transport = TransportController(project)
+    transport.toggle_record()
+    transport.play(TRACK_INPUTS, (False,) * 8)
+    first_input = np.full((4, 2), 0.2, dtype=np.float32)
+    second_input = np.column_stack(
+        (np.full(4, 0.3, np.float32), np.full(4, -0.3, np.float32))
+    )
+    third_input = np.column_stack(
+        (np.full(4, 0.4, np.float32), np.full(4, -0.4, np.float32))
+    )
+
+    before_punch = transport.process_audio(first_input, 4, None)
+    transport.set_armed_tracks((True, False) + (False,) * 6)
+    first_punch = transport.process_audio(second_input, 4, None)
+    transport.set_armed_tracks((False, True) + (False,) * 6)
+    second_punch = transport.process_audio(third_input, 4, None)
+    transport.set_armed_tracks((False,) * 8)
+    transport.stop()
+    recorded = project.read_audio_block(0, 12)
+
+    assert before_punch == pytest.approx(original[:4], abs=1e-6)
+    assert not first_punch[:, 0].any()
+    assert first_punch[:, 1] == pytest.approx(original[4:8, 1], abs=1e-6)
+    assert second_punch[:, 0] == pytest.approx(original[8:, 0], abs=1e-6)
+    assert not second_punch[:, 1].any()
+    assert recorded[:4] == pytest.approx(original[:4], abs=1e-6)
+    assert recorded[4:8, 0] == pytest.approx(second_input[:, 0], abs=1e-6)
+    assert recorded[4:8, 1] == pytest.approx(original[4:8, 1], abs=1e-6)
+    assert recorded[8:, 0] == pytest.approx(original[8:, 0], abs=1e-6)
+    assert recorded[8:, 1] == pytest.approx(third_input[:, 1], abs=1e-6)
+    project.close()
+
+
+def test_capture_block_keeps_callback_arm_mask_after_ui_changes(
+    tmp_path: Path,
+) -> None:
+    project = project_with_audio(tmp_path, np.zeros((1, 8), np.float32))
+    transport = TransportController(project)
+    callback_mask = (True, False) + (False,) * 6
+    transport.running = True
+    transport.record_armed = True
+    transport.set_armed_tracks(callback_mask)
+
+    transport.process_audio(np.ones((1, 2), np.float32), 1, None)
+    transport.set_armed_tracks((False, True) + (False,) * 6)
+    capture = transport._capture_queue.get_nowait()
+
+    assert capture.armed_tracks == callback_mask
+    transport.running = False
+    project.close()
+
+
+def test_live_punch_after_rolling_through_silence_extends_project(
+    tmp_path: Path,
+) -> None:
+    project = project_with_audio(tmp_path, np.zeros((2, 8), np.float32))
+    transport = TransportController(project)
+    transport.position_frames = 2
+    transport.toggle_record()
+
+    assert transport.play((0,) + (None,) * 7, (False,) * 8)
+    transport.process_audio(np.zeros((3, 1), np.float32), 3, None)
+    transport.set_armed_tracks((True,) + (False,) * 7)
+    transport.process_audio(np.full((3, 1), 0.5, np.float32), 3, None)
+    transport.stop()
+
+    assert project.frames == 8
+    recorded = project.read_audio_block(0, 8)
+    assert not recorded[2:5].any()
+    assert recorded[5:, 0] == pytest.approx([0.5] * 3, abs=1e-6)
     project.close()

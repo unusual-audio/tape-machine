@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -22,13 +23,64 @@ from tape_machine.audio import (
 
 
 PROJECT_APPLICATION_ID = "pkg.unusualaudio.tape-machine"
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2
 PROJECT_COMMENT_PREFIX = "TAPE_MACHINE_PROJECT:"
 WAV_FORMATS = {"WAV", "WAVEX", "RF64"}
+MIX_MIN_LEVEL_DB = -60.0
+MIX_MAX_LEVEL_DB = 6.0
 
 
 class ProjectError(RuntimeError):
     """Raised when a project file cannot be created, opened, or saved."""
+
+
+@dataclass(frozen=True, slots=True)
+class TrackMixMetadata:
+    """Persisted controls for one project track."""
+
+    level_db: float = 0.0
+    pan: float = 0.0
+    record_enabled: bool = False
+    input_monitoring: bool = False
+    muted: bool = False
+    soloed: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_mix_number(
+            "track level", self.level_db, MIX_MIN_LEVEL_DB, MIX_MAX_LEVEL_DB
+        )
+        _validate_mix_number("track pan", self.pan, -1.0, 1.0)
+        for name, value in (
+            ("record_enabled", self.record_enabled),
+            ("input_monitoring", self.input_monitoring),
+            ("muted", self.muted),
+            ("soloed", self.soloed),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"Track mix {name} must be boolean.")
+
+
+@dataclass(frozen=True, slots=True)
+class MixerMetadata:
+    """Persisted controls for all project tracks and the stereo bus."""
+
+    tracks: tuple[TrackMixMetadata, ...] = field(
+        default_factory=lambda: tuple(
+            TrackMixMetadata() for _ in range(PROJECT_TRACK_COUNT)
+        )
+    )
+    bus_level_db: float = 0.0
+
+    def __post_init__(self) -> None:
+        if len(self.tracks) != PROJECT_TRACK_COUNT:
+            raise ValueError(
+                f"Project mix must contain {PROJECT_TRACK_COUNT} tracks."
+            )
+        if not all(isinstance(track, TrackMixMetadata) for track in self.tracks):
+            raise ValueError("Project mix tracks must be track mix objects.")
+        _validate_mix_number(
+            "bus level", self.bus_level_db, MIX_MIN_LEVEL_DB, MIX_MAX_LEVEL_DB
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,8 +92,11 @@ class ProjectMetadata:
     track_inputs: tuple[int | None, ...] = UNASSIGNED_TRACK_INPUTS
     bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
     source_comment: str | None = None
+    mix: MixerMetadata = field(default_factory=MixerMetadata)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.mix, MixerMetadata):
+            raise ValueError("Project mix must be a mixer metadata object.")
         if len(self.track_inputs) != PROJECT_TRACK_COUNT:
             raise ValueError(
                 f"Project input routing must contain {PROJECT_TRACK_COUNT} tracks."
@@ -88,6 +143,10 @@ class ProjectMetadata:
             bus_outputs=bus_outputs,
         )
 
+    def with_mix(self, mix: MixerMetadata) -> ProjectMetadata:
+        """Return metadata updated from the project mixer."""
+        return replace(self, mix=mix)
+
     def to_comment(self) -> str:
         """Serialize metadata to the tagged WAV comment representation."""
         payload: dict[str, Any] = {
@@ -97,6 +156,7 @@ class ProjectMetadata:
             "output_device": _reference_payload(self.output_device),
             "track_inputs": list(self.track_inputs),
             "bus_outputs": list(self.bus_outputs),
+            "mix": _mixer_payload(self.mix),
         }
         if self.source_comment:
             payload["source_comment"] = self.source_comment
@@ -117,7 +177,12 @@ class ProjectMetadata:
             raise ProjectError("Project metadata must be a JSON object.")
         if payload.get("application") != PROJECT_APPLICATION_ID:
             raise ProjectError("Project metadata has an unknown application ID.")
-        if payload.get("schema_version") != PROJECT_SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version not in {1, PROJECT_SCHEMA_VERSION}
+        ):
             raise ProjectError(
                 "This project uses an unsupported metadata schema version."
             )
@@ -128,12 +193,18 @@ class ProjectMetadata:
             source_comment = payload.get("source_comment")
             if source_comment is not None and not isinstance(source_comment, str):
                 raise ValueError("source_comment must be text")
+            mix = (
+                MixerMetadata()
+                if schema_version == 1
+                else _mixer_from_payload(payload["mix"])
+            )
             return cls(
                 input_device=_reference_from_payload(payload.get("input_device")),
                 output_device=_reference_from_payload(payload.get("output_device")),
                 track_inputs=track_inputs,
                 bus_outputs=bus_outputs,
                 source_comment=source_comment,
+                mix=mix,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProjectError(f"Project metadata is invalid: {exc}") from exc
@@ -278,6 +349,12 @@ class AudioProject:
         self.metadata = candidate
         self.dirty = False
 
+    def stage_metadata(self, metadata: ProjectMetadata) -> None:
+        """Update project metadata in memory and mark it for an explicit save."""
+        if metadata != self.metadata:
+            self.metadata = metadata
+            self.dirty = True
+
     def read_audio_block(self, position: int, frames: int) -> np.ndarray:
         """Read an exact float32 block, padding beyond EOF with silence."""
         try:
@@ -400,6 +477,63 @@ def _reference_from_payload(payload: object) -> DeviceReference | None:
     if not isinstance(host_api, str) or not host_api:
         raise ValueError("device host_api must be non-empty text")
     return DeviceReference(name=name, host_api=host_api)
+
+
+def _mixer_payload(mix: MixerMetadata) -> dict[str, Any]:
+    return {
+        "tracks": [
+            {
+                "level_db": track.level_db,
+                "pan": track.pan,
+                "record_enabled": track.record_enabled,
+                "input_monitoring": track.input_monitoring,
+                "muted": track.muted,
+                "soloed": track.soloed,
+            }
+            for track in mix.tracks
+        ],
+        "bus_level_db": mix.bus_level_db,
+    }
+
+
+def _mixer_from_payload(payload: object) -> MixerMetadata:
+    if not isinstance(payload, dict):
+        raise ValueError("mix must be an object")
+    tracks_payload = payload["tracks"]
+    if not isinstance(tracks_payload, list):
+        raise ValueError("mix tracks must be an array")
+    tracks: list[TrackMixMetadata] = []
+    for track_payload in tracks_payload:
+        if not isinstance(track_payload, dict):
+            raise ValueError("mix tracks must be objects")
+        tracks.append(
+            TrackMixMetadata(
+                level_db=track_payload["level_db"],
+                pan=track_payload["pan"],
+                record_enabled=track_payload["record_enabled"],
+                input_monitoring=track_payload["input_monitoring"],
+                muted=track_payload["muted"],
+                soloed=track_payload["soloed"],
+            )
+        )
+    return MixerMetadata(
+        tracks=tuple(tracks),
+        bus_level_db=payload["bus_level_db"],
+    )
+
+
+def _validate_mix_number(
+    name: str, value: object, minimum: float, maximum: float
+) -> None:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not isfinite(value)
+        or not minimum <= value <= maximum
+    ):
+        raise ValueError(
+            f"Project mix {name} must be between {minimum:g} and {maximum:g}."
+        )
 
 
 def _transfer_dtype(subtype: str) -> str:

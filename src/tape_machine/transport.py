@@ -26,6 +26,7 @@ class TransportError(RuntimeError):
 class CaptureBlock:
     position: int
     data: np.ndarray
+    armed_tracks: tuple[bool, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,14 @@ class TransportController:
         self.record_armed = not self.record_armed
         return self.record_armed
 
+    def set_armed_tracks(self, armed_tracks: tuple[bool, ...]) -> None:
+        """Replace the track-arm snapshot used by the next audio callback."""
+        if len(armed_tracks) != PROJECT_TRACK_COUNT:
+            raise TransportError(
+                "Transport requires exactly eight record-enable states."
+            )
+        self._armed_tracks = armed_tracks
+
     def play(
         self,
         track_inputs: tuple[int | None, ...],
@@ -95,13 +104,9 @@ class TransportController:
             PROJECT_TRACK_COUNT
         ):
             raise TransportError("Transport requires exactly eight project tracks.")
-        if self.record_armed and not any(armed_tracks):
-            raise TransportError("Record-enable at least one track before recording.")
         if self.record_armed and any(armed_tracks) and not self.project.writable:
             raise TransportError("This project file is read-only and cannot record.")
-        if self.position_frames >= self.project.frames and not (
-            self.record_armed and any(armed_tracks)
-        ):
+        if self.position_frames >= self.project.frames and not self.record_armed:
             return False
 
         self._track_inputs = track_inputs
@@ -139,27 +144,30 @@ class TransportController:
         if not self.running:
             return None
         start_position = self.position_frames
+        record_armed = self.record_armed
+        armed_tracks = self._armed_tracks
+        recording = record_armed and any(armed_tracks)
         playback = np.zeros((frames, PROJECT_TRACK_COUNT), dtype=np.float32)
         copied = self._consume_playback(playback)
         reached_end = False
         if copied < frames:
             if start_position + copied < self._playback_end_frames:
                 self._fail("Project playback could not keep up with the audio stream.")
-            elif not self.recording:
+            elif not record_armed:
                 self.end_requested = True
                 reached_end = True
         elif (
-            not self.recording
+            not record_armed
             and start_position + copied >= self._playback_end_frames
         ):
             self.end_requested = True
             reached_end = True
 
-        if self.recording:
-            playback[:, self._armed_tracks] = 0
+        if recording:
+            playback[:, armed_tracks] = 0
             try:
                 self._capture_queue.put_nowait(
-                    CaptureBlock(start_position, indata.copy())
+                    CaptureBlock(start_position, indata.copy(), armed_tracks)
                 )
                 self._known_frames = max(
                     self._known_frames, start_position + frames
@@ -177,6 +185,7 @@ class TransportController:
 
     def stop(self) -> None:
         """Stop, drain recorded blocks, flush the project, and retain position."""
+        self.record_armed = False
         self.running = False
         self._stop_event.set()
         worker = self._worker
@@ -246,7 +255,7 @@ class TransportController:
             capture.position,
             capture.data,
             self._track_inputs,
-            self._armed_tracks,
+            capture.armed_tracks,
         )
         self._known_frames = max(
             self._known_frames, capture.position + len(capture.data)

@@ -136,8 +136,8 @@ class TapeMachine(toga.App):
     def _build_project_screen(self) -> toga.Box:
         assert self.project is not None
         project = self.project
-        self.mixer_state = MixerState.from_track_inputs(
-            project.metadata.track_inputs
+        self.mixer_state = MixerState.from_metadata(
+            project.metadata.track_inputs, project.metadata.mix
         )
         self.mixer_view = MixerView(
             project.metadata.track_inputs, self.mixer_state
@@ -289,11 +289,13 @@ class TapeMachine(toga.App):
                 self._schedule_audio_engine_dialog(str(exc))
                 raise
 
-        metadata = self.project.metadata.with_audio(
-            input_device.reference,
-            output_device.reference,
-            settings.track_inputs,
-            settings.bus_outputs,
+        metadata = (
+            self.project.metadata.with_audio(
+                input_device.reference,
+                output_device.reference,
+                settings.track_inputs,
+                settings.bus_outputs,
+            ).with_mix(self.mixer_state.to_metadata(settings.track_inputs))
         )
         try:
             self.project.save(metadata)
@@ -442,7 +444,7 @@ class TapeMachine(toga.App):
         )
         self.transport_starting = True
         if self.mixer_view is not None:
-            self.mixer_view.set_transport_running(True)
+            self.mixer_view.set_record_enable_locked(True)
         self._update_command_state()
         self._sync_transport_controls()
         try:
@@ -456,8 +458,8 @@ class TapeMachine(toga.App):
             started = False
         finally:
             self.transport_starting = False
-        if not started and self.mixer_view is not None:
-            self.mixer_view.set_transport_running(False)
+            if self.mixer_view is not None:
+                self.mixer_view.set_record_enable_locked(False)
         self._update_command_state()
         self._sync_transport_controls()
 
@@ -480,6 +482,8 @@ class TapeMachine(toga.App):
         ):
             return
         self.transport_stopping = True
+        if self.mixer_view is not None:
+            self.mixer_view.set_record_enable_locked(True)
         self._update_command_state()
         self._sync_transport_controls()
         error: str | None = None
@@ -491,7 +495,7 @@ class TapeMachine(toga.App):
         finally:
             self.transport_stopping = False
             if self.mixer_view is not None:
-                self.mixer_view.set_transport_running(False)
+                self.mixer_view.set_record_enable_locked(False)
         self._update_command_state()
         self._sync_transport_controls()
         if error is not None:
@@ -609,8 +613,22 @@ class TapeMachine(toga.App):
         return True
 
     def _mixer_changed(self) -> None:
+        if self.mixer_state is not None and self.transport is not None:
+            self.transport.set_armed_tracks(
+                tuple(
+                    track.record_enabled for track in self.mixer_state.tracks
+                )
+            )
         if self.mixer_state is not None and self.audio_engine.running:
             self.audio_engine.update_mix(self.mixer_state)
+        if self.mixer_state is not None and self.project is not None:
+            self.project.stage_metadata(
+                self.project.metadata.with_mix(
+                    self.mixer_state.to_metadata(
+                        self.project.metadata.track_inputs
+                    )
+                )
+            )
 
     def _set_audio_engine_failure(
         self, message: str, *, show_dialog: bool = True
@@ -690,9 +708,8 @@ class TapeMachine(toga.App):
         if self.project.dirty:
             discard = await self.main_window.dialog(
                 toga.ConfirmDialog(
-                    "Discard Unsaved Project Metadata?",
-                    "This imported WAV has unsaved Tape Machine metadata. "
-                    "Choose Cancel to return and save it first.",
+                    "Discard Unsaved Changes?",
+                    "Close without saving changes to this project?",
                 )
             )
             if not discard:
@@ -744,8 +761,8 @@ class TapeMachine(toga.App):
         if self.project.dirty:
             discard = await self.main_window.dialog(
                 toga.ConfirmDialog(
-                    "Discard Unsaved Project Metadata?",
-                    "Exit without saving Tape Machine project metadata?",
+                    "Discard Unsaved Changes?",
+                    "Exit without saving changes to this project?",
                 )
             )
             if not discard:

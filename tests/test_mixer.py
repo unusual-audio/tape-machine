@@ -6,10 +6,12 @@ from tape_machine.mixer import (
     MAX_LEVEL_DB,
     MIN_LEVEL_DB,
     MixerState,
+    MixerView,
     PanKnob,
     VerticalFader,
     format_level_db,
 )
+from tape_machine.project import MixerMetadata, TrackMixMetadata
 
 
 def test_mixer_defaults_to_unity_centered_and_inactive() -> None:
@@ -35,6 +37,57 @@ def test_mixer_defaults_to_unity_centered_and_inactive() -> None:
     assert not any(track.input_monitoring for track in state.tracks)
     assert not any(track.muted for track in state.tracks)
     assert not any(track.soloed for track in state.tracks)
+
+
+def test_mixer_restores_and_snapshots_all_persisted_controls() -> None:
+    saved_track = TrackMixMetadata(
+        level_db=-12.5,
+        pan=0.75,
+        record_enabled=True,
+        input_monitoring=True,
+        muted=True,
+        soloed=True,
+    )
+    mix = MixerMetadata(
+        tracks=(saved_track,) + (TrackMixMetadata(),) * 7,
+        bus_level_db=-4.5,
+    )
+    routes = (99,) + (None,) * 7
+
+    state = MixerState.from_metadata(routes, mix)
+
+    assert state.tracks[0].input_assigned is True
+    assert state.tracks[0].level_db == -12.5
+    assert state.tracks[0].pan == 0.75
+    assert state.tracks[0].record_enabled is True
+    assert state.tracks[0].input_monitoring is True
+    assert state.tracks[0].muted is True
+    assert state.tracks[0].soloed is True
+    assert state.bus_level_db == -4.5
+    assert state.to_metadata(routes) == mix
+
+
+def test_restoring_unassigned_track_clears_only_input_controls() -> None:
+    saved_track = TrackMixMetadata(
+        record_enabled=True,
+        input_monitoring=True,
+        muted=True,
+        soloed=True,
+    )
+    mix = MixerMetadata(
+        tracks=(saved_track,) + (TrackMixMetadata(),) * 7
+    )
+
+    state = MixerState.from_metadata((None,) * 8, mix)
+    track = state.tracks[0]
+
+    assert track.record_enabled is False
+    assert track.input_monitoring is False
+    assert track.muted is True
+    assert track.soloed is True
+    assert state.to_metadata().tracks[0] == TrackMixMetadata(
+        muted=True, soloed=True
+    )
 
 
 def test_input_only_controls_require_a_route() -> None:
@@ -150,3 +203,50 @@ def test_clearing_monitoring_notifies_only_when_state_changes() -> None:
 
     assert state.tracks[0].input_monitoring is False
     assert len(notifications) == 1
+
+
+def test_record_enable_lock_is_only_a_temporary_transition_state() -> None:
+    sync_calls: list[int] = []
+    strips = [
+        type(
+            "FakeStrip",
+            (),
+            {
+                "record_enable_locked": False,
+                "sync_controls": lambda self: sync_calls.append(1),
+            },
+        )()
+        for _ in range(8)
+    ]
+    view = MixerView.__new__(MixerView)
+    view.track_strips = strips
+
+    view.set_record_enable_locked(True)
+    view.set_record_enable_locked(False)
+
+    assert all(strip.record_enable_locked is False for strip in strips)
+    assert len(sync_calls) == 16
+
+
+def test_unavailable_monitoring_preserves_saved_monitor_state() -> None:
+    state = MixerState.from_track_inputs((0,) + (None,) * 7)
+    state.tracks[0].input_monitoring = True
+    strips = [
+        type(
+            "FakeStrip",
+            (),
+            {
+                "monitoring_available": True,
+                "sync_controls": lambda self: None,
+            },
+        )()
+        for _ in range(8)
+    ]
+    view = MixerView.__new__(MixerView)
+    view.state = state
+    view.track_strips = strips
+
+    view.set_monitoring_available(False)
+
+    assert all(strip.monitoring_available is False for strip in strips)
+    assert state.tracks[0].input_monitoring is True
