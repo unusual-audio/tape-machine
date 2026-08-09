@@ -1,6 +1,7 @@
 """Tests for the main-window audio summary."""
 
 import asyncio
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,9 @@ import pytest
 from tape_machine.app import (
     ShuttleButton,
     TapeMachine,
+    _LOGO_DISPLAY_HEIGHT,
+    _LOGO_DISPLAY_WIDTH,
+    _LOGO_RESOURCE,
     _fit_window_position,
     _tabular_number_font,
 )
@@ -144,6 +148,18 @@ def test_time_counter_uses_tabular_figures_in_a_proportional_font() -> None:
     assert font.isFixedPitch() is False
     assert width("11:11.111") == pytest.approx(width("88:88.888"))
     assert width("00:00.000") == pytest.approx(width("12:34.567"))
+
+
+def test_logo_resource_has_two_x_dimensions_and_alpha() -> None:
+    data = _LOGO_RESOURCE.read_bytes()
+
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height = struct.unpack(">II", data[16:24])
+    assert (width, height) == (
+        _LOGO_DISPLAY_WIDTH * 2,
+        _LOGO_DISPLAY_HEIGHT * 2,
+    )
+    assert data[25] == 6
 
 
 def test_status_line_marks_incomplete_routing() -> None:

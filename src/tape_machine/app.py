@@ -9,7 +9,7 @@ from typing import Callable
 import toga
 from rubicon.objc import NSObject, ObjCClass, objc_const, objc_method
 from rubicon.objc.runtime import load_library
-from toga.style.pack import CENTER, COLUMN, END, ROW
+from toga.style.pack import CENTER, COLUMN, ROW
 from toga_cocoa.libs import NSCursor
 
 from tape_machine.audio import (
@@ -45,6 +45,9 @@ from tape_machine.transport import (
 
 _TRANSPORT_BUTTON_WIDTH = 80
 _TRANSPORT_BAR_WIDTH = 880
+_LOGO_DISPLAY_WIDTH = 208
+_LOGO_DISPLAY_HEIGHT = 20
+_LOGO_RESOURCE = Path(__file__).with_name("resources") / "logo@2x.png"
 _MAIN_WINDOW_SIZE = (912, 584)
 _AUDIO_SETTINGS_WINDOW_SIZE = (900, 640)
 _RECORD_BUTTON_TEXT = "● REC"
@@ -492,18 +495,24 @@ class TapeMachine(toga.App):
             margin_top=4,
         )
         _style_time_counter(self.transport_time_label)
+        self.logo_view = toga.ImageView(
+            _LOGO_RESOURCE,
+            width=_LOGO_DISPLAY_WIDTH,
+            height=_LOGO_DISPLAY_HEIGHT,
+        )
         transport_bar = toga.Box(
             children=[
-                self.transport_record_button,
+                self.logo_view,
+                toga.Box(flex=1),
                 self.transport_rewind_button.widget,
-                self.transport_play_button,
-                self.transport_stop_rtz_button,
                 self.transport_fast_forward_button.widget,
+                self.transport_stop_rtz_button,
+                self.transport_play_button,
+                self.transport_record_button,
                 self.transport_time_label,
             ],
             direction=ROW,
             align_items=CENTER,
-            justify_content=END,
             width=_TRANSPORT_BAR_WIDTH,
             gap=6,
             margin_bottom=2,
