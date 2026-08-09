@@ -1,18 +1,25 @@
 """The Tape Machine Toga application."""
 
+import asyncio
 from pathlib import Path
 
 import toga
-from toga.style.pack import CENTER, COLUMN
+from toga.style.pack import CENTER, COLUMN, ROW
 
 from tape_machine.audio import (
     AudioConfigurationError,
     AudioDeviceService,
     AudioSettings,
 )
+from tape_machine.engine import AudioEngine, AudioEngineError
 from tape_machine.mixer import MixerState, MixerView
 from tape_machine.project import AudioProject, ProjectError, ProjectMetadata
 from tape_machine.settings import AudioSettingsDraft, AudioSettingsWindow
+from tape_machine.transport import (
+    TransportController,
+    TransportError,
+    format_transport_time,
+)
 
 
 class TapeMachine(toga.App):
@@ -21,6 +28,7 @@ class TapeMachine(toga.App):
     def startup(self) -> None:
         """Create and show the main application window."""
         self.audio_service = AudioDeviceService()
+        self.audio_engine = AudioEngine()
         try:
             self.audio_service.initialize()
             startup_error = None
@@ -30,8 +38,13 @@ class TapeMachine(toga.App):
         self.project: AudioProject | None = None
         self.mixer_state: MixerState | None = None
         self.mixer_view: MixerView | None = None
+        self.transport: TransportController | None = None
+        self.transport_task: asyncio.Task[None] | None = None
+        self.transport_starting = False
+        self.transport_stopping = False
         self.session_audio_settings = self.audio_service.current_settings
         self.project_audio_error: str | None = None
+        self.audio_engine_error: str | None = None
 
         self.status_line_label = toga.Label("", font_size=11)
 
@@ -129,8 +142,51 @@ class TapeMachine(toga.App):
         self.mixer_view = MixerView(
             project.metadata.track_inputs, self.mixer_state
         )
+        self.mixer_state.on_change = self._mixer_changed
+        self.transport = TransportController(project)
+        self.audio_engine.set_transport(self.transport)
+        self.transport_record_button = toga.Button(
+            "Record",
+            on_press=self._toggle_transport_record,
+            width=80,
+            height=28,
+        )
+        self.transport_play_button = toga.Button(
+            "Play",
+            on_press=self._play_transport,
+            width=60,
+            height=28,
+        )
+        self.transport_stop_rtz_button = toga.Button(
+            "RTZ",
+            on_press=self._stop_or_rtz,
+            width=60,
+            height=28,
+        )
+        self.transport_time_label = toga.Label(
+            "00:00.000",
+            width=104,
+            font_size=14,
+            font_weight="bold",
+            text_align=CENTER,
+            margin_left=10,
+            margin_top=4,
+        )
+        transport_bar = toga.Box(
+            children=[
+                self.transport_record_button,
+                self.transport_play_button,
+                self.transport_stop_rtz_button,
+                self.transport_time_label,
+            ],
+            direction=ROW,
+            align_items=CENTER,
+            justify_content=CENTER,
+            gap=6,
+            margin_bottom=2,
+        )
         central_content = toga.Box(
-            children=[self.mixer_view.widget],
+            children=[transport_bar, self.mixer_view.widget],
             direction=COLUMN,
             align_items=CENTER,
             flex=1,
@@ -157,10 +213,19 @@ class TapeMachine(toga.App):
 
     def _update_command_state(self) -> None:
         project_is_open = self.project is not None
+        transport_busy = bool(
+            self.transport
+            and (
+                self.transport.running
+                or self.transport_starting
+                or self.transport_stopping
+            )
+        )
         self.new_project_command.enabled = not project_is_open
         self.open_project_command.enabled = not project_is_open
-        self.save_project_command.enabled = project_is_open
-        self.close_project_command.enabled = project_is_open
+        self.save_project_command.enabled = project_is_open and not transport_busy
+        self.close_project_command.enabled = project_is_open and not transport_busy
+        self.settings_command.enabled = not transport_busy
 
     def preferences(
         self, widget: toga.Widget | toga.Command | None = None, **kwargs: object
@@ -181,6 +246,7 @@ class TapeMachine(toga.App):
         self.settings_window.open(
             draft,
             locked_sample_rate=self.project.sample_rate,
+            trusted_settings=(current if self.audio_engine.running else None),
             on_applied=self._project_audio_settings_applied,
         )
 
@@ -192,13 +258,36 @@ class TapeMachine(toga.App):
     def _project_audio_settings_applied(self, settings: AudioSettings) -> None:
         if self.project is None:
             raise ProjectError("No project is open.")
+        if self.mixer_state is None:
+            raise ProjectError("The project mixer is not available.")
 
-        self.audio_service.refresh_devices()
-        self.audio_service.validate(settings)
+        old_settings = self.audio_service.current_settings
+        reuse_stream = self.audio_engine.running and settings == old_settings
+        if not reuse_stream:
+            self.audio_service.refresh_devices()
+            self.audio_service.validate(settings)
         input_device = self.audio_service.device(settings.input_device_id, "input")
         output_device = self.audio_service.device(settings.output_device_id, "output")
         if input_device is None or output_device is None:
             raise AudioConfigurationError("The selected audio devices disappeared.")
+
+        old_engine_running = self.audio_engine.running
+        if not reuse_stream:
+            try:
+                self.audio_engine.start(
+                    settings,
+                    self.mixer_state,
+                    input_device,
+                    output_device,
+                )
+            except AudioEngineError as exc:
+                restored = self._restore_audio_engine(
+                    old_settings, old_engine_running
+                )
+                if not restored:
+                    self._set_audio_engine_failure(str(exc), show_dialog=False)
+                self._schedule_audio_engine_dialog(str(exc))
+                raise
 
         metadata = self.project.metadata.with_audio(
             input_device.reference,
@@ -206,11 +295,25 @@ class TapeMachine(toga.App):
             settings.track_inputs,
             settings.bus_outputs,
         )
-        self.project.save(metadata)
+        try:
+            self.project.save(metadata)
+        except Exception:
+            if not reuse_stream:
+                self.audio_engine.stop()
+                restored = self._restore_audio_engine(
+                    old_settings, old_engine_running
+                )
+                if not restored:
+                    self._set_audio_engine_failure(
+                        "The previous audio stream could not be restored."
+                    )
+            raise
         self.audio_service.current_settings = settings
         self.project_audio_error = None
         if self.mixer_view is not None:
             self.mixer_view.update_track_routes(settings.track_inputs)
+            self.mixer_view.set_monitoring_available(True)
+        self.audio_engine_error = None
         self._update_audio_summary()
 
     async def new_project(
@@ -303,7 +406,234 @@ class TapeMachine(toga.App):
         self._update_command_state()
         self.main_window.content = self._build_project_screen()
         self.main_window.title = f"{self.formal_name} — {project.path.name}"
+        self._start_project_audio()
+        self._update_command_state()
+        self._sync_transport_controls()
+        self.transport_task = asyncio.create_task(self._transport_clock())
         self._update_audio_summary(self.project_audio_error)
+
+    def _toggle_transport_record(
+        self, widget: toga.Widget | None = None, **kwargs: object
+    ) -> None:
+        if self.transport is None or self.project is None:
+            return
+        if not self.project.writable and not self.transport.record_armed:
+            self._schedule_transport_dialog(
+                "This project file is read-only and cannot record."
+            )
+            return
+        self.transport.toggle_record()
+        self._sync_transport_controls()
+
+    async def _play_transport(
+        self, widget: toga.Widget | None = None, **kwargs: object
+    ) -> None:
+        if (
+            self.transport is None
+            or self.mixer_state is None
+            or self.audio_service.current_settings is None
+            or not self.audio_engine.running
+            or self.transport.running
+            or self.transport_starting
+        ):
+            return
+        armed_tracks = tuple(
+            track.record_enabled for track in self.mixer_state.tracks
+        )
+        self.transport_starting = True
+        if self.mixer_view is not None:
+            self.mixer_view.set_transport_running(True)
+        self._update_command_state()
+        self._sync_transport_controls()
+        try:
+            started = await asyncio.to_thread(
+                self.transport.play,
+                self.audio_service.current_settings.track_inputs,
+                armed_tracks,
+            )
+        except TransportError as exc:
+            self._schedule_transport_dialog(str(exc))
+            started = False
+        finally:
+            self.transport_starting = False
+        if not started and self.mixer_view is not None:
+            self.mixer_view.set_transport_running(False)
+        self._update_command_state()
+        self._sync_transport_controls()
+
+    async def _stop_or_rtz(
+        self, widget: toga.Widget | None = None, **kwargs: object
+    ) -> None:
+        if self.transport is None:
+            return
+        if self.transport.running:
+            await self._stop_transport()
+        else:
+            self.transport.return_to_zero()
+            self._sync_transport_controls()
+
+    async def _stop_transport(self) -> None:
+        if (
+            self.transport is None
+            or self.transport_stopping
+            or not self.transport.running
+        ):
+            return
+        self.transport_stopping = True
+        self._update_command_state()
+        self._sync_transport_controls()
+        error: str | None = None
+        try:
+            await asyncio.to_thread(self.transport.stop)
+            error = self.transport.terminal_error
+        except Exception as exc:
+            error = f"Unable to stop transport cleanly: {exc}"
+        finally:
+            self.transport_stopping = False
+            if self.mixer_view is not None:
+                self.mixer_view.set_transport_running(False)
+        self._update_command_state()
+        self._sync_transport_controls()
+        if error is not None:
+            self._schedule_transport_dialog(error)
+
+    async def _transport_clock(self) -> None:
+        transport = self.transport
+        try:
+            while self.transport is transport and transport is not None:
+                self._sync_transport_controls()
+                if transport.running and transport.end_requested:
+                    await self._stop_transport()
+                await asyncio.sleep(1 / 30)
+        except asyncio.CancelledError:
+            pass
+
+    def _sync_transport_controls(self) -> None:
+        if self.transport is None or not hasattr(
+            self, "transport_record_button"
+        ):
+            return
+        busy = self.transport_starting or self.transport_stopping
+        rolling = self.transport.running
+        engine_available = self.audio_engine.running
+        self.transport_record_button.enabled = (
+            engine_available
+            and not busy
+            and bool(self.project and self.project.writable)
+        )
+        if self.transport.record_armed:
+            self.transport_record_button.text = "● Record"
+            self.transport_record_button.style.background_color = "#d94b4b"
+        else:
+            self.transport_record_button.text = "Record"
+            del self.transport_record_button.style.background_color
+        self.transport_play_button.enabled = (
+            engine_available and not rolling and not busy
+        )
+        self.transport_stop_rtz_button.text = "Stop" if rolling else "RTZ"
+        self.transport_stop_rtz_button.enabled = (
+            not busy and (rolling or self.transport.position_frames > 0)
+        )
+        if self.project is not None:
+            self.transport_time_label.text = format_transport_time(
+                self.transport.position_frames, self.project.sample_rate
+            )
+
+    def _schedule_transport_dialog(self, message: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(
+            self.main_window.dialog(toga.ErrorDialog("Transport Error", message))
+        )
+
+    def _start_project_audio(self) -> None:
+        settings = self.audio_service.current_settings
+        if settings is None or self.project_audio_error is not None:
+            self._set_audio_engine_failure(
+                self.project_audio_error or "No usable audio devices are available."
+            )
+            return
+        input_device = self.audio_service.device(settings.input_device_id, "input")
+        output_device = self.audio_service.device(
+            settings.output_device_id, "output"
+        )
+        if input_device is None or output_device is None:
+            self._set_audio_engine_failure(
+                "The selected audio devices are no longer available."
+            )
+            return
+        assert self.mixer_state is not None
+        try:
+            self.audio_engine.start(
+                settings,
+                self.mixer_state,
+                input_device,
+                output_device,
+            )
+        except AudioEngineError as exc:
+            self._set_audio_engine_failure(str(exc))
+            return
+        self.audio_engine_error = None
+        if self.mixer_view is not None:
+            self.mixer_view.set_monitoring_available(True)
+        self._sync_transport_controls()
+
+    def _restore_audio_engine(
+        self,
+        settings: AudioSettings | None,
+        was_running: bool,
+    ) -> bool:
+        if not was_running or settings is None or self.mixer_state is None:
+            return False
+        input_device = self.audio_service.device(settings.input_device_id, "input")
+        output_device = self.audio_service.device(
+            settings.output_device_id, "output"
+        )
+        if input_device is None or output_device is None:
+            return False
+        try:
+            self.audio_engine.start(
+                settings,
+                self.mixer_state,
+                input_device,
+                output_device,
+            )
+        except AudioEngineError:
+            return False
+        self.audio_engine_error = None
+        if self.mixer_view is not None:
+            self.mixer_view.set_monitoring_available(True)
+        self._update_audio_summary()
+        return True
+
+    def _mixer_changed(self) -> None:
+        if self.mixer_state is not None and self.audio_engine.running:
+            self.audio_engine.update_mix(self.mixer_state)
+
+    def _set_audio_engine_failure(
+        self, message: str, *, show_dialog: bool = True
+    ) -> None:
+        self.audio_engine.stop()
+        self.audio_engine_error = message
+        if self.mixer_view is not None:
+            self.mixer_view.set_monitoring_available(False)
+        self._sync_transport_controls()
+        self._update_audio_summary()
+        if show_dialog:
+            self._schedule_audio_engine_dialog(message)
+
+    def _schedule_audio_engine_dialog(self, message: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(
+            self.main_window.dialog(
+                toga.ErrorDialog("Audio Engine Error", message)
+            )
+        )
 
     def _resolve_project_audio(self) -> str | None:
         assert self.project is not None
@@ -351,6 +681,12 @@ class TapeMachine(toga.App):
     ) -> None:
         if self.project is None:
             return
+        if self.transport is not None and (
+            self.transport.running
+            or self.transport_starting
+            or self.transport_stopping
+        ):
+            return
         if self.project.dirty:
             discard = await self.main_window.dialog(
                 toga.ConfirmDialog(
@@ -369,10 +705,21 @@ class TapeMachine(toga.App):
         self._leave_project()
 
     def _leave_project(self) -> None:
+        self.audio_engine.stop()
+        self.audio_engine.set_transport(None)
+        if self.transport_task is not None:
+            self.transport_task.cancel()
+        self.transport_task = None
+        self.transport_starting = False
+        self.transport_stopping = False
+        if self.mixer_state is not None:
+            self.mixer_state.on_change = None
         self.project = None
         self.mixer_state = None
         self.mixer_view = None
+        self.transport = None
         self.project_audio_error = None
+        self.audio_engine_error = None
         self.settings_window.window.hide()
         try:
             self.audio_service.refresh_devices()
@@ -390,6 +737,10 @@ class TapeMachine(toga.App):
     async def on_exit(self) -> bool:
         if self.project is None:
             return True
+        if self.transport_starting or self.transport_stopping:
+            return False
+        if self.transport is not None and self.transport.running:
+            await self._stop_transport()
         if self.project.dirty:
             discard = await self.main_window.dialog(
                 toga.ConfirmDialog(
@@ -404,6 +755,7 @@ class TapeMachine(toga.App):
         except Exception as exc:
             await self._show_project_error(f"Unable to close project: {exc}")
             return False
+        self.audio_engine.stop()
         return True
 
     async def _show_project_error(self, message: str) -> None:
@@ -464,6 +816,8 @@ class TapeMachine(toga.App):
         parts = [device_summary, sample_rate_summary]
         if not routing_complete:
             parts.append("Routing incomplete")
+        if self.project is not None and self.audio_engine_error is not None:
+            parts.append("Audio unavailable")
         self.status_line_label.text = "  •  ".join(parts)
 
 

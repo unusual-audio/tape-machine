@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import soundfile
 
 from tape_machine.audio import (
@@ -242,6 +243,11 @@ class AudioProject:
         return self.audio_file.frames
 
     @property
+    def writable(self) -> bool:
+        """Whether the open project handle can modify audio data."""
+        return "+" in self.audio_file.mode or "w" in self.audio_file.mode
+
+    @property
     def format(self) -> str:
         return self.audio_file.format
 
@@ -271,6 +277,56 @@ class AudioProject:
             raise ProjectError(f"Unable to save project metadata: {exc}") from exc
         self.metadata = candidate
         self.dirty = False
+
+    def read_audio_block(self, position: int, frames: int) -> np.ndarray:
+        """Read an exact float32 block, padding beyond EOF with silence."""
+        try:
+            self.audio_file.seek(position)
+            return self.audio_file.read(
+                frames,
+                dtype="float32",
+                always_2d=True,
+                fill_value=0.0,
+            )
+        except Exception as exc:
+            raise ProjectError(f"Unable to read project audio: {exc}") from exc
+
+    def write_recording_block(
+        self,
+        position: int,
+        input_data: np.ndarray,
+        track_inputs: tuple[int | None, ...],
+        armed_tracks: tuple[bool, ...],
+    ) -> None:
+        """Replace armed tracks while preserving every unarmed channel."""
+        if not self.writable:
+            raise ProjectError("This project file is read-only and cannot record.")
+        if len(track_inputs) != PROJECT_TRACK_COUNT or len(armed_tracks) != (
+            PROJECT_TRACK_COUNT
+        ):
+            raise ProjectError("Recording requires exactly eight project tracks.")
+        block = self.read_audio_block(position, len(input_data))
+        for track_index, (input_channel, armed) in enumerate(
+            zip(track_inputs, armed_tracks, strict=True)
+        ):
+            if not armed:
+                continue
+            if input_channel is None or input_channel >= input_data.shape[1]:
+                block[:, track_index] = 0
+            else:
+                block[:, track_index] = input_data[:, input_channel]
+        try:
+            self.audio_file.seek(position)
+            self.audio_file.write(block)
+        except Exception as exc:
+            raise ProjectError(f"Unable to write recorded audio: {exc}") from exc
+
+    def flush_audio(self) -> None:
+        """Flush recorded audio and its updated RF64 header to disk."""
+        try:
+            self.audio_file.flush()
+        except Exception as exc:
+            raise ProjectError(f"Unable to flush recorded audio: {exc}") from exc
 
     def _rewrite_for_metadata(self, metadata: ProjectMetadata) -> None:
         """Atomically convert a read-only-open import to writable RF64."""

@@ -79,6 +79,7 @@ class AudioSettingsWindow:
         self.on_applied = on_applied
         self.draft = AudioSettingsDraft.from_settings(None)
         self.locked_sample_rate: int | None = None
+        self.trusted_settings: AudioSettings | None = None
         self._updating = False
         self.track_inputs = UNASSIGNED_TRACK_INPUTS
         self.bus_outputs = UNASSIGNED_BUS_OUTPUTS
@@ -156,6 +157,7 @@ class AudioSettingsWindow:
         draft: AudioSettingsDraft | None = None,
         *,
         locked_sample_rate: int | None = None,
+        trusted_settings: AudioSettings | None = None,
         on_applied: Callable[[AudioSettings], None] | None = None,
     ) -> None:
         """Refresh and show the window, or leave an already-visible draft intact."""
@@ -165,6 +167,7 @@ class AudioSettingsWindow:
             self.service.current_settings
         )
         self.locked_sample_rate = locked_sample_rate
+        self.trusted_settings = trusted_settings
         self.on_applied = on_applied or self.default_on_applied
         self._load_draft()
         self.window.show()
@@ -301,7 +304,11 @@ class AudioSettingsWindow:
                     self.track_inputs,
                     self.bus_outputs,
                 )
-                compatibility_error = self.service.compatibility_error(candidate)
+                compatibility_error = (
+                    None
+                    if candidate == self.trusted_settings
+                    else self.service.compatibility_error(candidate)
+                )
                 self.save_button.enabled = compatibility_error is None
                 self.status_label.text = compatibility_error or (
                     "Project sample rate is fixed by the WAV file."
@@ -694,7 +701,6 @@ class AudioSettingsWindow:
             bus_outputs=self.bus_outputs,
         )
         try:
-            self.service.validate(settings)
             self.on_applied(settings)
         except (AudioConfigurationError, RuntimeError) as exc:
             self.status_label.text = str(exc)

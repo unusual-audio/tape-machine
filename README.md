@@ -3,7 +3,7 @@
 A standalone macOS application built with [BeeWare Toga](https://toga.beeware.org/)
 and packaged with [Briefcase](https://briefcase.beeware.org/). Audio devices are
 discovered with [python-sounddevice](https://python-sounddevice.readthedocs.io/),
-and recorded audio will be stored with
+and multichannel project audio is stored with
 [python-soundfile](https://python-soundfile.readthedocs.io/).
 
 ## Audio settings
@@ -34,9 +34,19 @@ read-only, and Audio Settings are saved directly into the project file. Use
 The project screen presents eight track strips and a stereo-bus strip. Each track
 has a vertical −∞ to +6 dB fader, a pan knob, and record, input-monitor, mute,
 and solo controls. Record and monitoring are available only when that track has
-an assigned input. The stereo strip controls the bus level. Mixer controls are
-currently interactive session state; they do not yet process audio or persist in
-the project file.
+an assigned input. The stereo strip controls the bus level. Input monitoring is
+mixed in real time through the track level, constant-power pan, mute/solo state,
+and stereo-bus level before being sent to the configured device outputs. Mixer
+controls remain session state and are not persisted in the project file.
+
+The transport provides a record toggle, play, a combined stop/return-to-zero
+button, and a `MM:SS.mmm` position display. Record-enable the desired tracks,
+toggle Record, and press Play to start recording. Record can be toggled while
+rolling for punch-in and punch-out. Armed tracks overwrite the corresponding
+project channels with their raw, pre-fader inputs; unarmed tracks are preserved.
+During a punch, existing audio on armed tracks is suppressed, while enabled input
+monitoring remains audible. Project playback passes through the live fader, pan,
+mute, solo, and stereo-bus controls.
 
 ## Development
 

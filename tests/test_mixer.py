@@ -119,3 +119,34 @@ def test_invalid_mixer_route_or_control_is_rejected() -> None:
         state.update_input_routes((0,))
     with pytest.raises(ValueError, match="Unknown mixer control"):
         state.toggle(0, "phase")
+
+
+def test_mixer_changes_notify_the_audio_engine() -> None:
+    state = MixerState.from_track_inputs(
+        (0, None, None, None, None, None, None, None)
+    )
+    notifications: list[None] = []
+    state.on_change = lambda: notifications.append(None)
+
+    state.set_track_level(0, -3)
+    state.set_pan(0, 0.5)
+    state.set_bus_level(-6)
+    state.toggle(0, "input_monitoring")
+    state.toggle(0, "muted")
+
+    assert len(notifications) == 5
+
+
+def test_clearing_monitoring_notifies_only_when_state_changes() -> None:
+    state = MixerState.from_track_inputs(
+        (0, None, None, None, None, None, None, None)
+    )
+    state.tracks[0].input_monitoring = True
+    notifications: list[None] = []
+    state.on_change = lambda: notifications.append(None)
+
+    state.clear_monitoring()
+    state.clear_monitoring()
+
+    assert state.tracks[0].input_monitoring is False
+    assert len(notifications) == 1

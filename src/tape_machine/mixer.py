@@ -70,6 +70,9 @@ class MixerState:
         ]
     )
     bus_level_db: float = UNITY_LEVEL_DB
+    on_change: Callable[[], None] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @classmethod
     def from_track_inputs(
@@ -92,19 +95,23 @@ class MixerState:
             if not track.input_assigned:
                 track.record_enabled = False
                 track.input_monitoring = False
+        self._notify()
 
     def set_track_level(self, track_index: int, value: float) -> float:
         value = clamp(value, MIN_LEVEL_DB, MAX_LEVEL_DB)
         self.tracks[track_index].level_db = value
+        self._notify()
         return value
 
     def set_bus_level(self, value: float) -> float:
         self.bus_level_db = clamp(value, MIN_LEVEL_DB, MAX_LEVEL_DB)
+        self._notify()
         return self.bus_level_db
 
     def set_pan(self, track_index: int, value: float) -> float:
         value = clamp(value, -1.0, 1.0)
         self.tracks[track_index].pan = value
+        self._notify()
         return value
 
     def toggle(self, track_index: int, control: str) -> bool:
@@ -118,7 +125,22 @@ class MixerState:
             return False
         value = not getattr(track, control)
         setattr(track, control, value)
+        self._notify()
         return value
+
+    def clear_monitoring(self) -> None:
+        """Disable input monitoring on every track."""
+        changed = False
+        for track in self.tracks:
+            if track.input_monitoring:
+                track.input_monitoring = False
+                changed = True
+        if changed:
+            self._notify()
+
+    def _notify(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
 
 
 class VerticalFader:
@@ -297,6 +319,8 @@ class TrackStrip:
         self.index = index
         self.mixer_state = mixer_state
         self.state = mixer_state.tracks[index]
+        self.monitoring_available = False
+        self.transport_running = False
         self.pan = PanKnob(
             self.state.pan,
             lambda value: self.mixer_state.set_pan(self.index, value),
@@ -374,10 +398,16 @@ class TrackStrip:
 
     def sync_controls(self) -> None:
         for control, button in self.buttons.items():
-            button.enabled = not (
-                control in {"record_enabled", "input_monitoring"}
-                and not self.state.input_assigned
-            )
+            if control == "record_enabled":
+                button.enabled = (
+                    self.state.input_assigned and not self.transport_running
+                )
+            elif control == "input_monitoring":
+                button.enabled = (
+                    self.state.input_assigned and self.monitoring_available
+                )
+            else:
+                button.enabled = True
             if getattr(self.state, control):
                 button.style.background_color = _CONTROL_COLORS[control]
             else:
@@ -455,4 +485,18 @@ class MixerView:
     ) -> None:
         self.state.update_input_routes(track_inputs)
         for strip in self.track_strips:
+            strip.sync_controls()
+
+    def set_monitoring_available(self, available: bool) -> None:
+        """Enable monitor controls only while an audio stream is running."""
+        if not available:
+            self.state.clear_monitoring()
+        for strip in self.track_strips:
+            strip.monitoring_available = available
+            strip.sync_controls()
+
+    def set_transport_running(self, running: bool) -> None:
+        """Lock record-enable targets for the duration of a transport run."""
+        for strip in self.track_strips:
+            strip.transport_running = running
             strip.sync_controls()

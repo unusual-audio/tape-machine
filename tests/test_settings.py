@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
-from tape_machine.audio import UNASSIGNED_BUS_OUTPUTS, UNASSIGNED_TRACK_INPUTS
-from tape_machine.settings import AudioSettingsWindow
+from tape_machine.audio import (
+    UNASSIGNED_BUS_OUTPUTS,
+    UNASSIGNED_TRACK_INPUTS,
+    AudioDevice,
+    AudioSettings,
+)
+from tape_machine.settings import AudioSettingsWindow, DeviceChoice
 
 
 @dataclass
@@ -147,3 +153,40 @@ def test_changing_output_device_preserves_portable_stereo_routing() -> None:
         )
     ]
     assert rate_updates == [48_000]
+
+
+def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
+    input_device = AudioDevice(1, "Interface", "Core Audio", 8, 2, 48_000)
+    output_device = AudioDevice(1, "Interface", "Core Audio", 8, 2, 48_000)
+    settings = AudioSettings(1, 1, 48_000, (0,) + (None,) * 7, (0, 1))
+    compatibility_calls: list[AudioSettings] = []
+    window = AudioSettingsWindow.__new__(AudioSettingsWindow)
+    window._updating = False
+    window.locked_sample_rate = 48_000
+    window.trusted_settings = settings
+    window.track_inputs = settings.track_inputs
+    window.bus_outputs = settings.bus_outputs
+    window.input_selection = SimpleNamespace(
+        value=DeviceChoice(input_device, "input")
+    )
+    window.output_selection = SimpleNamespace(
+        value=DeviceChoice(output_device, "output")
+    )
+    window.sample_rate_selection = SimpleNamespace(
+        items=[], value=None, enabled=True
+    )
+    window.save_button = SimpleNamespace(enabled=False)
+    window.status_label = SimpleNamespace(text="")
+    window.service = SimpleNamespace(
+        compatibility_error=lambda candidate: compatibility_calls.append(
+            candidate
+        )
+    )
+
+    window._update_sample_rates()
+
+    assert compatibility_calls == []
+    assert window.save_button.enabled is True
+    assert window.status_label.text == (
+        "Project sample rate is fixed by the WAV file."
+    )
