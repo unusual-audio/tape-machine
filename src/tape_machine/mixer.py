@@ -289,18 +289,20 @@ class VerticalFader:
         on_change: Callable[[float], None],
         *,
         meter_channels: int = 1,
+        on_interaction: Callable[[], None] | None = None,
     ) -> None:
         if meter_channels not in (1, 2):
             raise ValueError("A fader meter must have one or two channels.")
         self.value = clamp(value, MIN_LEVEL_DB, MAX_LEVEL_DB)
         self.on_change = on_change
+        self.on_interaction = on_interaction
         self.meter_channels = meter_channels
         self.meter_levels = (MIN_LEVEL_DB,) * meter_channels
         self.canvas = toga.Canvas(
             width=_FADER_WIDTH,
             height=_FADER_HEIGHT,
             on_resize=self._draw,
-            on_press=self._move,
+            on_press=self._start_move,
             on_drag=self._move,
             on_activate=self._reset,
         )
@@ -352,10 +354,21 @@ class VerticalFader:
     ) -> None:
         self.set_value(self.value_from_y(y))
 
+    def _start_move(
+        self, widget: toga.Canvas, x: int, y: int, **kwargs: object
+    ) -> None:
+        self._interacted()
+        self._move(widget, x, y, **kwargs)
+
     def _reset(
         self, widget: toga.Canvas, x: int, y: int, **kwargs: object
     ) -> None:
+        self._interacted()
         self.set_value(UNITY_LEVEL_DB)
+
+    def _interacted(self) -> None:
+        if self.on_interaction is not None:
+            self.on_interaction()
 
     def _draw(self, widget: toga.Canvas, **kwargs: object) -> None:
         clear_canvas(widget)
@@ -426,9 +439,12 @@ class PanKnob:
         self,
         value: float,
         on_change: Callable[[float], None],
+        *,
+        on_interaction: Callable[[], None] | None = None,
     ) -> None:
         self.value = clamp(value, -1.0, 1.0)
         self.on_change = on_change
+        self.on_interaction = on_interaction
         self._drag_start_y = 0
         self._drag_start_value = self.value
         self.canvas = toga.Canvas(
@@ -468,6 +484,7 @@ class PanKnob:
     def _start_drag(
         self, widget: toga.Canvas, x: int, y: int, **kwargs: object
     ) -> None:
+        self._interacted()
         self._drag_start_y = y
         self._drag_start_value = self.value
 
@@ -481,7 +498,12 @@ class PanKnob:
     def _reset(
         self, widget: toga.Canvas, x: int, y: int, **kwargs: object
     ) -> None:
+        self._interacted()
         self.set_value(0.0)
+
+    def _interacted(self) -> None:
+        if self.on_interaction is not None:
+            self.on_interaction()
 
     def _draw(self, widget: toga.Canvas, **kwargs: object) -> None:
         clear_canvas(widget)
@@ -506,20 +528,28 @@ class PanKnob:
 class TrackStrip:
     """UI for one project-track mixer strip."""
 
-    def __init__(self, index: int, mixer_state: MixerState) -> None:
+    def __init__(
+        self,
+        index: int,
+        mixer_state: MixerState,
+        on_interaction: Callable[[], None] | None = None,
+    ) -> None:
         self.index = index
         self.mixer_state = mixer_state
         self.state = mixer_state.tracks[index]
         self.monitoring_available = False
         self.record_enable_locked = False
         self._normalizing_name = False
+        self.on_interaction = on_interaction
         self.pan = PanKnob(
             self.state.pan,
             lambda value: self.mixer_state.set_pan(self.index, value),
+            on_interaction=on_interaction,
         )
         self.fader = VerticalFader(
             self.state.level_db,
             lambda value: self.mixer_state.set_track_level(self.index, value),
+            on_interaction=on_interaction,
         )
         self.buttons: dict[str, toga.Button] = {}
         button_specs = (
@@ -561,11 +591,12 @@ class TrackStrip:
         self.name_input = toga.TextInput(
             value=self.state.name,
             on_change=self._limit_name,
-            on_confirm=self._commit_name,
+            on_confirm=self._confirm_name,
             on_lose_focus=self._commit_name,
             width=80,
             height=24,
             font_size=10,
+            text_align=CENTER,
             margin_top=6,
             margin_bottom=2,
         )
@@ -609,6 +640,13 @@ class TrackStrip:
         if widget.value != normalized:
             self._set_name_value(widget, normalized)
 
+    def _confirm_name(
+        self, widget: toga.TextInput, **kwargs: object
+    ) -> None:
+        """Commit a Return-confirmed edit and leave text-entry mode."""
+        self._commit_name(widget, **kwargs)
+        self._interacted()
+
     def _set_name_value(self, widget: toga.TextInput, value: str) -> None:
         self._normalizing_name = True
         try:
@@ -620,10 +658,15 @@ class TrackStrip:
         self, control: str
     ) -> Callable[[toga.Button], None]:
         def handler(widget: toga.Button, **kwargs: object) -> None:
+            self._interacted()
             self.mixer_state.toggle(self.index, control)
             self.sync_controls()
 
         return handler
+
+    def _interacted(self) -> None:
+        if self.on_interaction is not None:
+            self.on_interaction()
 
     def sync_controls(self) -> None:
         for control, button in self.buttons.items():
@@ -646,12 +689,17 @@ class TrackStrip:
 class StereoBusStrip:
     """Level-only stereo-bus strip aligned with the track strips."""
 
-    def __init__(self, mixer_state: MixerState) -> None:
+    def __init__(
+        self,
+        mixer_state: MixerState,
+        on_interaction: Callable[[], None] | None = None,
+    ) -> None:
         self.mixer_state = mixer_state
         self.fader = VerticalFader(
             mixer_state.bus_level_db,
             mixer_state.set_bus_level,
             meter_channels=2,
+            on_interaction=on_interaction,
         )
         self.widget = toga.Box(
             children=[
@@ -685,9 +733,19 @@ class MixerView:
         if state is not None:
             self.state.update_input_routes(track_inputs)
         self.track_strips = [
-            TrackStrip(index, self.state) for index in range(PROJECT_TRACK_COUNT)
+            TrackStrip(
+                index,
+                self.state,
+                on_interaction=self._end_name_editing,
+            )
+            for index in range(PROJECT_TRACK_COUNT)
         ]
-        self.bus_strip = StereoBusStrip(self.state)
+        for strip in self.track_strips:
+            strip.name_input.on_gain_focus = self._name_input_focused
+        self._configure_name_tab_order()
+        self.bus_strip = StereoBusStrip(
+            self.state, on_interaction=self._end_name_editing
+        )
         mixer_row = toga.Box(
             children=[
                 *(strip.widget for strip in self.track_strips),
@@ -710,6 +768,31 @@ class MixerView:
             vertical=False,
             flex=1,
         )
+
+    def _name_input_focused(
+        self, widget: toga.TextInput, **kwargs: object
+    ) -> None:
+        """Restore the custom key-view loop after Cocoa attaches the view."""
+        self._configure_name_tab_order()
+
+    def _configure_name_tab_order(self) -> None:
+        """Cycle Tab focus through the eight scribble strips in track order."""
+        name_inputs = [strip.name_input for strip in self.track_strips]
+        following_inputs = name_inputs[1:] + name_inputs[:1]
+        for current, following in zip(
+            name_inputs, following_inputs, strict=True
+        ):
+            current._impl.native.nextKeyView = following._impl.native
+
+    def _end_name_editing(self) -> None:
+        """Clear focus only when a mixer scribble strip is being edited."""
+        for strip in self.track_strips:
+            name_input = strip.name_input
+            if not name_input._impl.has_focus:
+                continue
+            if name_input.window is not None:
+                name_input.window._impl.native.makeFirstResponder(None)
+            return
 
     def update_track_routes(
         self, track_inputs: tuple[TrackInputRoute, ...]

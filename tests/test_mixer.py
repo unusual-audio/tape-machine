@@ -315,6 +315,8 @@ def test_scribble_strip_limits_and_commits_inline_edits() -> None:
     strip.index = 0
     strip.mixer_state = state
     strip._normalizing_name = False
+    interactions: list[str] = []
+    strip.on_interaction = lambda: interactions.append("defocus")
     widget = SimpleNamespace(value="🎤" * 17)
 
     strip._limit_name(widget)
@@ -330,7 +332,97 @@ def test_scribble_strip_limits_and_commits_inline_edits() -> None:
     strip._commit_name(widget)
     assert widget.value == "Track 1"
     assert state.tracks[0].name == "Track 1"
-    assert len(notifications) == 2
+    assert interactions == []
+
+    widget.value = "Guitar"
+    strip._confirm_name(widget)
+    assert state.tracks[0].name == "Guitar"
+    assert interactions == ["defocus"]
+    assert len(notifications) == 3
+
+
+def test_mixer_controls_request_defocus_before_their_actions() -> None:
+    events: list[object] = []
+    fader = VerticalFader.__new__(VerticalFader)
+    fader.on_interaction = lambda: events.append("defocus")
+    fader.set_value = lambda value: events.append(("fader", value))
+
+    fader._start_move(SimpleNamespace(), 0, 214)
+
+    assert events == ["defocus", ("fader", MIN_LEVEL_DB)]
+
+    events.clear()
+    pan = PanKnob.__new__(PanKnob)
+    pan.on_interaction = lambda: events.append("defocus")
+    pan.value = 0.25
+
+    pan._start_drag(SimpleNamespace(), 0, 100)
+
+    assert events == ["defocus"]
+    assert pan._drag_start_y == 100
+    assert pan._drag_start_value == 0.25
+
+    events.clear()
+    strip = TrackStrip.__new__(TrackStrip)
+    strip.index = 0
+    strip.on_interaction = lambda: events.append("defocus")
+    strip.mixer_state = SimpleNamespace(
+        toggle=lambda index, control: events.append((index, control))
+    )
+    strip.sync_controls = lambda: events.append("sync")
+
+    strip._toggle_handler("muted")(SimpleNamespace())
+
+    assert events == ["defocus", (0, "muted"), "sync"]
+
+
+def test_mixer_view_clears_only_active_scribble_strip_focus() -> None:
+    calls: list[object] = []
+    native_window = SimpleNamespace(
+        makeFirstResponder=lambda responder: calls.append(responder)
+    )
+    window = SimpleNamespace(_impl=SimpleNamespace(native=native_window))
+    inactive_input = SimpleNamespace(
+        _impl=SimpleNamespace(has_focus=False), window=window
+    )
+    active_input = SimpleNamespace(
+        _impl=SimpleNamespace(has_focus=True), window=window
+    )
+    view = MixerView.__new__(MixerView)
+    view.track_strips = [
+        SimpleNamespace(name_input=inactive_input),
+        SimpleNamespace(name_input=active_input),
+    ]
+
+    view._end_name_editing()
+
+    assert calls == [None]
+
+    active_input._impl.has_focus = False
+    view._end_name_editing()
+    assert calls == [None]
+
+
+def test_scribble_strip_tab_order_cycles_through_all_tracks() -> None:
+    native_inputs = [
+        SimpleNamespace(nextKeyView=None) for _ in range(8)
+    ]
+    view = MixerView.__new__(MixerView)
+    view.track_strips = [
+        SimpleNamespace(
+            name_input=SimpleNamespace(
+                _impl=SimpleNamespace(native=native_input)
+            )
+        )
+        for native_input in native_inputs
+    ]
+
+    view._configure_name_tab_order()
+
+    assert [native.nextKeyView for native in native_inputs] == [
+        *native_inputs[1:],
+        native_inputs[0],
+    ]
 
 
 def test_clearing_monitoring_notifies_only_when_state_changes() -> None:
