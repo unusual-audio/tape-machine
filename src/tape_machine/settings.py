@@ -176,7 +176,6 @@ class AudioSettingsWindow:
         self.on_applied = on_applied
         self.draft = AudioSettingsDraft.from_settings(None)
         self.locked_sample_rate: int | None = None
-        self.trusted_settings: AudioSettings | None = None
         self._updating = False
         self.track_inputs = UNASSIGNED_TRACK_INPUTS
         self.bus_outputs = UNASSIGNED_BUS_OUTPUTS
@@ -264,7 +263,6 @@ class AudioSettingsWindow:
         draft: AudioSettingsDraft | None = None,
         *,
         locked_sample_rate: int | None = None,
-        trusted_settings: AudioSettings | None = None,
         on_applied: Callable[[AudioSettings], None] | None = None,
     ) -> None:
         """Refresh and show the window, or leave an already-visible draft intact."""
@@ -274,7 +272,6 @@ class AudioSettingsWindow:
             self.service.current_settings
         )
         self.locked_sample_rate = locked_sample_rate
-        self.trusted_settings = trusted_settings
         self.on_applied = on_applied or self.default_on_applied
         self._load_draft()
         self.window.show()
@@ -413,21 +410,11 @@ class AudioSettingsWindow:
                 self.sample_rate_selection.items = [locked_choice]
                 self.sample_rate_selection.value = locked_choice
                 self.sample_rate_selection.enabled = False
-                candidate = AudioSettings(
-                    input_choice.device.index,
-                    output_choice.device.index,
-                    self.locked_sample_rate,
-                    self.track_inputs,
-                    self.bus_outputs,
-                    self._selected_buffer_size(),
-                )
-                compatibility_error = (
-                    None
-                    if candidate == self.trusted_settings
-                    else self.service.compatibility_error(candidate)
-                )
-                self._set_save_enabled(compatibility_error is None)
-                self.status_label.text = compatibility_error or (
+                # Do not call PortAudio's format probe while the project's
+                # duplex stream is active. The candidate is validated after
+                # that stream has been stopped when Save is pressed.
+                self._set_save_enabled(True)
+                self.status_label.text = (
                     "Project sample rate is fixed by the WAV file."
                 )
                 return
@@ -725,7 +712,7 @@ class AudioSettingsWindow:
             track_inputs[track_index] = None
 
         self.track_inputs = tuple(track_inputs)
-        self._update_sample_rates(self._selected_rate())
+        self._refresh_save_state_after_routing_change()
 
     def _output_route_handler(self, output_channel: int, bus_index: int):
         def handler(widget: toga.Switch, **kwargs: object) -> None:
@@ -774,7 +761,18 @@ class AudioSettingsWindow:
             bus_outputs[bus_index] = None
 
         self.bus_outputs = tuple(bus_outputs)
-        self._update_sample_rates(self._selected_rate())
+        self._refresh_save_state_after_routing_change()
+
+    def _refresh_save_state_after_routing_change(self) -> None:
+        """Update the draft without probing CoreAudio from a matrix click."""
+        if self._selected_settings() is None:
+            return
+        self._set_save_enabled(True)
+        self.status_label.text = (
+            "Project sample rate is fixed by the WAV file."
+            if self.locked_sample_rate is not None
+            else ""
+        )
 
     def _show_inventory_problem(self) -> None:
         if not self.service.input_devices and not self.service.output_devices:

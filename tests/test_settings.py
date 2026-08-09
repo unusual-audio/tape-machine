@@ -40,7 +40,9 @@ def routing_window(
     window.route_switches = {}
     rate_updates: list[int | None] = []
     window._selected_rate = lambda: 48_000
-    window._update_sample_rates = rate_updates.append
+    window._refresh_save_state_after_routing_change = lambda: (
+        rate_updates.append(window._selected_rate())
+    )
     return window, rate_updates
 
 
@@ -53,7 +55,9 @@ def output_routing_window(
     window.output_route_switches = {}
     rate_updates: list[int | None] = []
     window._selected_rate = lambda: 48_000
-    window._update_sample_rates = rate_updates.append
+    window._refresh_save_state_after_routing_change = lambda: (
+        rate_updates.append(window._selected_rate())
+    )
     return window, rate_updates
 
 
@@ -269,7 +273,7 @@ def test_changing_output_device_preserves_portable_stereo_routing() -> None:
     assert rate_updates == [48_000]
 
 
-def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
+def test_locked_rate_does_not_probe_an_edited_active_configuration() -> None:
     input_device = AudioDevice(1, "Interface", "Core Audio", 8, 2, 48_000)
     output_device = AudioDevice(1, "Interface", "Core Audio", 8, 2, 48_000)
     settings = AudioSettings(
@@ -279,8 +283,7 @@ def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
     window = AudioSettingsWindow.__new__(AudioSettingsWindow)
     window._updating = False
     window.locked_sample_rate = 48_000
-    window.trusted_settings = settings
-    window.track_inputs = settings.track_inputs
+    window.track_inputs = (1,) + (None,) * 7
     window.bus_outputs = settings.bus_outputs
     window.input_selection = SimpleNamespace(
         value=DeviceChoice(input_device, "input")
@@ -309,6 +312,50 @@ def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
     assert window.status_label.text == (
         "Project sample rate is fixed by the WAV file."
     )
+
+
+@pytest.mark.parametrize(
+    ("locked_rate", "message"),
+    [
+        (None, ""),
+        (48_000, "Project sample rate is fixed by the WAV file."),
+    ],
+)
+def test_route_click_only_updates_draft_save_state(
+    locked_rate: int | None,
+    message: str,
+) -> None:
+    input_device = AudioDevice(1, "Input", "Core Audio", 8, 0, 48_000)
+    output_device = AudioDevice(2, "Output", "Core Audio", 0, 2, 48_000)
+    window = AudioSettingsWindow.__new__(AudioSettingsWindow)
+    window.locked_sample_rate = locked_rate
+    window.input_selection = SimpleNamespace(
+        value=DeviceChoice(input_device, "input")
+    )
+    window.output_selection = SimpleNamespace(
+        value=DeviceChoice(output_device, "output")
+    )
+    window.track_inputs = (0,) + (None,) * 7
+    window.bus_outputs = (0, 1)
+    window._selected_rate = lambda: 48_000
+    window.buffer_size_selection = SimpleNamespace(
+        value=BufferSizeChoice(256)
+    )
+    window.save_button = SimpleNamespace(enabled=False)
+    window.status_label = SimpleNamespace(text="old status")
+    window.service = SimpleNamespace(
+        supported_sample_rates=lambda *args: pytest.fail(
+            "route click must not probe Core Audio"
+        ),
+        compatibility_error=lambda *args: pytest.fail(
+            "route click must not validate Core Audio"
+        ),
+    )
+
+    window._refresh_save_state_after_routing_change()
+
+    assert window.save_button.enabled is True
+    assert window.status_label.text == message
 
 
 def test_save_applies_settings_and_closes() -> None:

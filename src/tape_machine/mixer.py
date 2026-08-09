@@ -76,12 +76,11 @@ def format_level_db(value: float) -> str:
     return f"{value:+.1f} dB"
 
 
-def normalize_track_name(track_index: int, value: str) -> str:
+def normalize_track_name(value: str) -> str:
     """Normalize an edited track name for display and persistence."""
     if not isinstance(value, str):
         raise ValueError("Track name must be text.")
-    normalized = value.strip()[:TRACK_NAME_MAX_LENGTH]
-    return normalized or default_track_name(track_index)
+    return value.strip()[:TRACK_NAME_MAX_LENGTH]
 
 
 def level_y(value: float) -> float:
@@ -165,7 +164,7 @@ class MixerState:
                     ),
                     muted=saved.muted,
                     soloed=saved.soloed,
-                    name=normalize_track_name(index, saved.name),
+                    name=normalize_track_name(saved.name),
                 )
             )
         return cls(tracks=tracks, bus_level_db=mix.bus_level_db)
@@ -202,7 +201,7 @@ class MixerState:
                     ),
                     muted=track.muted,
                     soloed=track.soloed,
-                    name=normalize_track_name(index, track.name),
+                    name=normalize_track_name(track.name),
                 )
             )
         return MixerMetadata(
@@ -245,7 +244,7 @@ class MixerState:
 
     def set_track_name(self, track_index: int, value: str) -> str:
         """Commit a normalized scribble-strip name for one track."""
-        normalized = normalize_track_name(track_index, value)
+        normalized = normalize_track_name(value)
         track = self.tracks[track_index]
         if track.name != normalized:
             track.name = normalized
@@ -365,7 +364,12 @@ class VerticalFader:
         self, widget: toga.Canvas, x: int, y: int, **kwargs: object
     ) -> None:
         self._interacted()
-        self.set_value(UNITY_LEVEL_DB)
+        target = (
+            MIN_LEVEL_DB
+            if self.value == UNITY_LEVEL_DB
+            else UNITY_LEVEL_DB
+        )
+        self.set_value(target)
 
     def _interacted(self) -> None:
         if self.on_interaction is not None:

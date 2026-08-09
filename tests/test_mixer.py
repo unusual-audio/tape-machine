@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tape_machine.audio import StereoBusInput
+from tape_machine.audio import UNASSIGNED_TRACK_INPUTS, StereoBusInput
 from tape_machine.mixer import (
     MAX_LEVEL_DB,
     MIN_LEVEL_DB,
@@ -12,6 +12,7 @@ from tape_machine.mixer import (
     MixerView,
     PanKnob,
     TrackStrip,
+    UNITY_LEVEL_DB,
     VerticalFader,
     format_level_db,
     level_y,
@@ -267,6 +268,31 @@ def test_pan_vertical_drag_and_level_readouts() -> None:
     assert format_level_db(0) == "+0.0 dB"
 
 
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        (UNITY_LEVEL_DB, MIN_LEVEL_DB),
+        (-12.0, UNITY_LEVEL_DB),
+        (MIN_LEVEL_DB, UNITY_LEVEL_DB),
+    ],
+)
+def test_fader_double_click_toggles_unity_and_silence(
+    current: float,
+    expected: float,
+) -> None:
+    interactions: list[None] = []
+    values: list[float] = []
+    fader = VerticalFader.__new__(VerticalFader)
+    fader.value = current
+    fader.on_interaction = lambda: interactions.append(None)
+    fader.set_value = values.append
+
+    fader._reset(SimpleNamespace(), 0, 0)
+
+    assert interactions == [None]
+    assert values == [expected]
+
+
 def test_invalid_mixer_route_or_control_is_rejected() -> None:
     state = MixerState()
 
@@ -299,12 +325,24 @@ def test_track_names_are_normalized_and_notify_only_when_changed() -> None:
 
     assert state.set_track_name(0, "  Lead Vocal  ") == "Lead Vocal"
     assert state.set_track_name(0, "Lead Vocal") == "Lead Vocal"
-    assert state.set_track_name(0, "   ") == "Track 1"
+    assert state.set_track_name(0, "   ") == ""
     assert state.set_track_name(1, "x" * 20) == "x" * 16
 
-    assert state.tracks[0].name == "Track 1"
+    assert state.tracks[0].name == ""
     assert state.tracks[1].name == "x" * 16
     assert len(notifications) == 3
+
+
+def test_empty_track_name_round_trips_through_mixer_metadata() -> None:
+    default_mix = MixerMetadata()
+    mix = MixerMetadata(
+        tracks=(TrackMixMetadata(name=""),) + default_mix.tracks[1:]
+    )
+
+    state = MixerState.from_metadata(UNASSIGNED_TRACK_INPUTS, mix)
+
+    assert state.tracks[0].name == ""
+    assert state.to_metadata().tracks[0].name == ""
 
 
 def test_scribble_strip_limits_and_commits_inline_edits() -> None:
@@ -330,8 +368,8 @@ def test_scribble_strip_limits_and_commits_inline_edits() -> None:
 
     widget.value = ""
     strip._commit_name(widget)
-    assert widget.value == "Track 1"
-    assert state.tracks[0].name == "Track 1"
+    assert widget.value == ""
+    assert state.tracks[0].name == ""
     assert interactions == []
 
     widget.value = "Guitar"

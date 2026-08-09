@@ -19,6 +19,7 @@ from tape_machine.app import (
     _tabular_number_font,
 )
 from tape_machine.audio import (
+    AudioConfigurationError,
     AudioDevice,
     AudioSettings,
     DeviceReference,
@@ -583,6 +584,18 @@ def test_project_audio_settings_persist_globally_after_stream_starts() -> None:
     )
     service = FakeService(old_settings)
     engine = FakeLifecycleEngine()
+    probe_states: list[tuple[str, bool]] = []
+
+    def refresh_devices() -> None:
+        service.refresh_calls += 1
+        probe_states.append(("refresh", engine.running))
+
+    def validate(settings: AudioSettings) -> None:
+        service.validate_calls += 1
+        probe_states.append(("validate", engine.running))
+
+    service.refresh_devices = refresh_devices
+    service.validate = validate
     project = FakeProject()
     mixer_state = MixerState()
     mixer_state.tracks[0].level_db = -8.0
@@ -610,8 +623,9 @@ def test_project_audio_settings_persist_globally_after_stream_starts() -> None:
 
     TapeMachine._project_audio_settings_applied(app, new_settings)
 
-    assert engine.stop_calls == 1
+    assert engine.stop_calls == 2
     assert engine.starts == [new_settings]
+    assert probe_states == [("refresh", False), ("validate", False)]
     assert project.saved == []
     assert project.staged[-1].mix.tracks[0].level_db == -8.0
     assert project.staged[-1].mix.tracks[0].muted is True
@@ -724,6 +738,42 @@ def test_failed_candidate_stream_keeps_project_metadata_and_old_settings() -> No
     assert saved_configs == []
     assert service.current_settings == old_settings
     assert dialogs == ["Unable to start input monitoring: busy"]
+
+
+def test_failed_audio_probe_restores_stream_after_stopping_it() -> None:
+    old_settings = AudioSettings(1, 1, 48_000)
+    new_settings = AudioSettings(1, 1, 48_000, buffer_size=256)
+    service = FakeService(old_settings)
+    service.validate = lambda settings: (_ for _ in ()).throw(
+        AudioConfigurationError("Core Audio rejected the route")
+    )
+    engine = FakeLifecycleEngine()
+    restores: list[tuple[AudioSettings | None, bool]] = []
+    app = object.__new__(TapeMachine)
+    app.project = FakeProject()
+    app.audio_service = service
+    app.audio_engine = engine
+    app.mixer_state = MixerState()
+    app.mixer_view = None
+    app.global_audio_settings = old_settings
+    app.app_config = AppConfig()
+
+    def restore(settings: AudioSettings | None, was_running: bool) -> bool:
+        restores.append((settings, was_running))
+        engine.running = True
+        return True
+
+    app._restore_audio_engine = restore
+    app._set_audio_engine_failure = lambda *args, **kwargs: None
+
+    with pytest.raises(
+        AudioConfigurationError, match="Core Audio rejected the route"
+    ):
+        TapeMachine._project_audio_settings_applied(app, new_settings)
+
+    assert engine.stop_calls == 1
+    assert engine.running is True
+    assert restores == [(old_settings, True)]
 
 
 def test_failed_global_config_save_restores_project_stream_and_settings() -> None:

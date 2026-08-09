@@ -807,7 +807,6 @@ class TapeMachine(toga.App):
         self.settings_window.open(
             draft,
             locked_sample_rate=self.project.sample_rate,
-            trusted_settings=(current if self.audio_engine.running else None),
         )
 
     def _open_routing_settings(
@@ -859,14 +858,45 @@ class TapeMachine(toga.App):
         old_settings = self.audio_service.current_settings
         old_global_settings = self.global_audio_settings
         old_config = self.app_config
-        reuse_stream = self.audio_engine.running and settings == old_settings
+        old_engine_running = self.audio_engine.running
+        reuse_stream = old_engine_running and settings == old_settings
         if not reuse_stream:
-            self.audio_service.refresh_devices()
-            self.audio_service.validate(settings)
-        input_device = self.audio_service.device(settings.input_device_id, "input")
-        output_device = self.audio_service.device(settings.output_device_id, "output")
-        if input_device is None or output_device is None:
-            raise AudioConfigurationError("The selected audio devices disappeared.")
+            if old_engine_running:
+                self.audio_engine.stop()
+            try:
+                self.audio_service.refresh_devices()
+                self.audio_service.validate(settings)
+                input_device = self.audio_service.device(
+                    settings.input_device_id, "input"
+                )
+                output_device = self.audio_service.device(
+                    settings.output_device_id, "output"
+                )
+                if input_device is None or output_device is None:
+                    raise AudioConfigurationError(
+                        "The selected audio devices disappeared."
+                    )
+            except AudioConfigurationError:
+                restored = self._restore_audio_engine(
+                    old_settings, old_engine_running
+                )
+                if old_engine_running and not restored:
+                    self._set_audio_engine_failure(
+                        "The previous audio stream could not be restored.",
+                        show_dialog=False,
+                    )
+                raise
+        else:
+            input_device = self.audio_service.device(
+                settings.input_device_id, "input"
+            )
+            output_device = self.audio_service.device(
+                settings.output_device_id, "output"
+            )
+            if input_device is None or output_device is None:
+                raise AudioConfigurationError(
+                    "The selected audio devices disappeared."
+                )
 
         global_sample_rate = (
             old_global_settings.sample_rate
@@ -878,7 +908,6 @@ class TapeMachine(toga.App):
         global_settings = replace(settings, sample_rate=global_sample_rate)
         updated_config = self._updated_config_for_audio_settings(global_settings)
 
-        old_engine_running = self.audio_engine.running
         if not reuse_stream:
             try:
                 self.audio_engine.start(
