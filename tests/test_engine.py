@@ -312,9 +312,17 @@ def test_callback_renders_current_matrix_and_clips_final_output() -> None:
 def test_callback_routes_project_playback_through_the_mixer() -> None:
     class FakeTransport:
         def prepare_audio(
-            self, frames: int, status: object
+            self,
+            frames: int,
+            status: object,
+            destination: np.ndarray | None = None,
         ) -> tuple[np.ndarray, None]:
-            playback = np.zeros((frames, 8), dtype=np.float32)
+            playback = (
+                destination
+                if destination is not None
+                else np.zeros((frames, 8), dtype=np.float32)
+            )
+            playback.fill(0)
             playback[:, 0] = 0.25
             return playback, None
 
@@ -342,6 +350,51 @@ def test_callback_routes_project_playback_through_the_mixer() -> None:
     assert not outdata[:, 1].any()
 
 
+def test_callback_reuses_transport_and_bus_scratch_buffers() -> None:
+    class ScratchTransport:
+        def __init__(self) -> None:
+            self.destinations: list[np.ndarray] = []
+
+        def prepare_audio(
+            self,
+            frames: int,
+            status: object,
+            destination: np.ndarray | None = None,
+        ) -> tuple[np.ndarray, None]:
+            assert destination is not None
+            destination.fill(0)
+            self.destinations.append(destination)
+            return destination, None
+
+        def submit_capture(
+            self,
+            context: object,
+            input_data: np.ndarray,
+            stereo_bus: np.ndarray,
+        ) -> None:
+            raise AssertionError("playback did not request capture")
+
+    transport = ScratchTransport()
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.set_transport(transport)
+    engine.start(
+        settings(), MixerState(), device(index=1), device(index=2)
+    )
+    callback = backend.streams[0].kwargs["callback"]
+
+    for _ in range(2):
+        callback(
+            np.zeros((4, 1), dtype=np.float32),
+            np.zeros((4, 2), dtype=np.float32),
+            4,
+            None,
+            None,
+        )
+
+    assert transport.destinations[0].base is transport.destinations[1].base
+
+
 def test_callback_submits_actual_bus_even_without_hardware_outputs() -> None:
     capture_token = object()
 
@@ -350,9 +403,17 @@ def test_callback_submits_actual_bus_even_without_hardware_outputs() -> None:
             self.captures: list[tuple[np.ndarray, np.ndarray]] = []
 
         def prepare_audio(
-            self, frames: int, status: object
+            self,
+            frames: int,
+            status: object,
+            destination: np.ndarray | None = None,
         ) -> tuple[np.ndarray, object]:
-            playback = np.zeros((frames, 8), dtype=np.float32)
+            playback = (
+                destination
+                if destination is not None
+                else np.zeros((frames, 8), dtype=np.float32)
+            )
+            playback.fill(0)
             playback[:, 3] = 0.25
             return playback, capture_token
 

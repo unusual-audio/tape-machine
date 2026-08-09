@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from math import ceil
 from queue import Empty, Full, Queue
-from threading import Event, Thread
+from threading import Condition, Event, Thread
 from time import monotonic
+from typing import Sequence
 
 import numpy as np
+import soundfile
 
 from tape_machine.audio import (
     PROJECT_TRACK_COUNT,
@@ -18,9 +22,13 @@ from tape_machine.audio import (
 from tape_machine.project import AudioProject, ProjectError
 
 
-DISK_BLOCK_FRAMES = 4096
-PLAYBACK_QUEUE_BLOCKS = 8
-CAPTURE_QUEUE_BLOCKS = 128
+DISK_BLOCK_FRAMES = 8192
+PLAYBACK_BUFFER_SECONDS = 1.0
+PLAYBACK_PREBUFFER_SECONDS = 0.25
+CAPTURE_BUFFER_SECONDS = 3.0
+CAPTURE_BATCH_FRAMES = 8192
+CAPTURE_COALESCE_SECONDS = 0.010
+RECORDING_CHECKPOINT_SECONDS = 5.0
 SHUTTLE_SPEED = 10
 SHUTTLE_GAIN_DB = -9.0
 SHUTTLE_GAIN = 10 ** (SHUTTLE_GAIN_DB / 20.0)
@@ -68,6 +76,90 @@ class PlaybackBlock:
     data: np.ndarray
 
 
+class _CaptureBuffer:
+    """A callback-facing queue limited by audio duration, not block count."""
+
+    def __init__(self, max_frames: int) -> None:
+        self.max_frames = max_frames
+        self._blocks: deque[CaptureBlock] = deque()
+        self._buffered_frames = 0
+        self._condition = Condition()
+
+    @property
+    def buffered_frames(self) -> int:
+        with self._condition:
+            return self._buffered_frames
+
+    def empty(self) -> bool:
+        with self._condition:
+            return not self._blocks
+
+    def put_nowait(self, block: CaptureBlock) -> None:
+        frames = len(block.input_data)
+        with self._condition:
+            if self._buffered_frames + frames > self.max_frames:
+                raise Full
+            self._blocks.append(block)
+            self._buffered_frames += frames
+            self._condition.notify()
+
+    def get_nowait(self) -> CaptureBlock:
+        with self._condition:
+            if not self._blocks:
+                raise Empty
+            block = self._blocks.popleft()
+            self._buffered_frames -= len(block.input_data)
+            return block
+
+    def clear(self) -> None:
+        with self._condition:
+            self._blocks.clear()
+            self._buffered_frames = 0
+
+    def wake(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def wait_for_batch(
+        self,
+        target_frames: int,
+        coalesce_seconds: float,
+        stop_event: Event,
+    ) -> tuple[CaptureBlock, ...]:
+        """Wait briefly, then pop one contiguous arm-mask-compatible batch."""
+        with self._condition:
+            while not self._blocks:
+                if stop_event.is_set():
+                    return ()
+                self._condition.wait(timeout=0.05)
+
+            deadline = monotonic() + coalesce_seconds
+            while self._buffered_frames < target_frames:
+                remaining = deadline - monotonic()
+                if remaining <= 0 or stop_event.is_set():
+                    break
+                self._condition.wait(timeout=remaining)
+
+            first = self._blocks.popleft()
+            batch = [first]
+            batch_frames = len(first.input_data)
+            next_position = first.position + batch_frames
+            while self._blocks:
+                candidate = self._blocks[0]
+                candidate_frames = len(candidate.input_data)
+                if (
+                    candidate.armed_tracks != first.armed_tracks
+                    or candidate.position != next_position
+                    or batch_frames + candidate_frames > target_frames
+                ):
+                    break
+                batch.append(self._blocks.popleft())
+                batch_frames += candidate_frames
+                next_position += candidate_frames
+            self._buffered_frames -= batch_frames
+            return tuple(batch)
+
+
 def format_transport_time(position_frames: int, sample_rate: int) -> str:
     """Format a frame position as unbounded MM:SS.mmm."""
     total_ms = max(0, position_frames) * 1000 // sample_rate
@@ -77,7 +169,7 @@ def format_transport_time(position_frames: int, sample_rate: int) -> str:
 
 
 class TransportController:
-    """Coordinate an audio callback with a dedicated project disk worker."""
+    """Coordinate an audio callback with independent disk I/O workers."""
 
     def __init__(self, project: AudioProject) -> None:
         self.project = project
@@ -95,17 +187,20 @@ class TransportController:
         self._playback_end_frames = project.frames
         self._read_cursor = 0
         self._worker_mode = TransportMode.STOPPED
-        self._playback_queue: Queue[PlaybackBlock] = Queue(
-            maxsize=PLAYBACK_QUEUE_BLOCKS
-        )
-        self._capture_queue: Queue[CaptureBlock] = Queue(
-            maxsize=CAPTURE_QUEUE_BLOCKS
+        self._playback_queue: Queue[PlaybackBlock] = Queue(maxsize=1)
+        self._capture_queue = _CaptureBuffer(
+            max(1, round(project.sample_rate * CAPTURE_BUFFER_SECONDS))
         )
         self._current_playback: PlaybackBlock | None = None
         self._current_offset = 0
         self._stop_event = Event()
         self._ready_event = Event()
-        self._worker: Thread | None = None
+        self._playback_space_event = Event()
+        self._prebuffer_target_frames = 0
+        self._prebuffered_frames = 0
+        self._playback_reader: soundfile.SoundFile | None = None
+        self._playback_worker_thread: Thread | None = None
+        self._capture_worker_thread: Thread | None = None
 
     @property
     def running(self) -> bool:
@@ -202,34 +297,71 @@ class TransportController:
         self.terminal_error = None
         self._current_playback = None
         self._current_offset = 0
-        self._drain_queue(self._playback_queue)
-        self._drain_queue(self._capture_queue)
+        playback_block_frames = (
+            SHUTTLE_OUTPUT_BLOCK_FRAMES if mode.shuttling else DISK_BLOCK_FRAMES
+        )
+        playback_blocks = max(
+            1,
+            ceil(
+                self.project.sample_rate
+                * PLAYBACK_BUFFER_SECONDS
+                / playback_block_frames
+            ),
+        )
+        self._playback_queue = Queue(maxsize=playback_blocks)
+        self._capture_queue.clear()
         self._stop_event.clear()
         self._ready_event.clear()
+        self._playback_space_event.clear()
         self._worker_mode = mode
-        self._worker = Thread(
-            target=self._disk_worker,
-            name="TapeMachineTransport",
+        source_frames = (
+            self._playback_end_frames - self._read_cursor
+            if mode is not TransportMode.REWIND
+            else self._read_cursor
+        )
+        available_output_frames = max(0, source_frames)
+        if mode.shuttling:
+            available_output_frames = ceil(
+                available_output_frames / SHUTTLE_SPEED
+            )
+        self._prebuffer_target_frames = min(
+            available_output_frames,
+            max(
+                1,
+                round(
+                    self.project.sample_rate * PLAYBACK_PREBUFFER_SECONDS
+                ),
+            ),
+        )
+        self._prebuffered_frames = 0
+        self._playback_reader = self.project.open_playback_reader()
+        self._capture_worker_thread = Thread(
+            target=self._capture_worker_main,
+            name="TapeMachineCapture",
             daemon=True,
         )
-        self._worker.start()
+        self._playback_worker_thread = Thread(
+            target=self._playback_worker_main,
+            args=(self._playback_reader,),
+            name="TapeMachinePlayback",
+            daemon=True,
+        )
+        self._capture_worker_thread.start()
+        self._playback_worker_thread.start()
         if not self._ready_event.wait(timeout=2.0):
-            self._stop_event.set()
-            self._worker.join(timeout=2.0)
-            self._worker = None
-            self._worker_mode = TransportMode.STOPPED
+            self._finish_workers(timeout=2.0)
             raise TransportError("Timed out while prebuffering project audio.")
         if self.terminal_error is not None:
-            self._stop_event.set()
-            self._worker.join(timeout=2.0)
-            self._worker = None
-            self._worker_mode = TransportMode.STOPPED
+            self._finish_workers(timeout=2.0)
             raise TransportError(self.terminal_error)
         self.mode = mode
         return True
 
     def prepare_audio(
-        self, frames: int, status: object
+        self,
+        frames: int,
+        status: object,
+        destination: np.ndarray | None = None,
     ) -> tuple[np.ndarray | None, CaptureContext | None]:
         """Consume playback and return capture state for the rendered bus."""
         if not self.running:
@@ -238,13 +370,15 @@ class TransportController:
         start_position = self.position_frames
         if mode.shuttling:
             return (
-                self._process_shuttle_audio(frames, mode, start_position),
+                self._process_shuttle_audio(
+                    frames, mode, start_position, destination
+                ),
                 None,
             )
         record_armed = self.record_armed
         armed_tracks = self._armed_tracks
         recording = record_armed and any(armed_tracks)
-        playback = np.zeros((frames, PROJECT_TRACK_COUNT), dtype=np.float32)
+        playback = self._prepare_destination(frames, destination)
         copied = self._consume_playback(playback)
         reached_end = False
         if copied < frames:
@@ -305,7 +439,11 @@ class TransportController:
                 self._known_frames, context.position + context.frames
             )
         except Full:
-            self._fail("Recording buffer overflowed; the disk is too slow.")
+            self._fail(
+                "Recording buffer overflowed after "
+                f"{CAPTURE_BUFFER_SECONDS:g} seconds; "
+                "storage could not keep up."
+            )
 
     def process_audio(
         self, indata: np.ndarray, frames: int, status: object
@@ -327,8 +465,9 @@ class TransportController:
         frames: int,
         mode: TransportMode,
         start_position: int,
+        destination: np.ndarray | None = None,
     ) -> np.ndarray:
-        playback = np.zeros((frames, PROJECT_TRACK_COUNT), dtype=np.float32)
+        playback = self._prepare_destination(frames, destination)
         copied = self._consume_playback(playback)
         source_advance = copied * SHUTTLE_SPEED
         if mode is TransportMode.FAST_FORWARD:
@@ -348,25 +487,35 @@ class TransportController:
             self.end_requested = True
         return playback
 
+    @staticmethod
+    def _prepare_destination(
+        frames: int, destination: np.ndarray | None
+    ) -> np.ndarray:
+        if destination is None:
+            return np.zeros(
+                (frames, PROJECT_TRACK_COUNT), dtype=np.float32
+            )
+        if destination.shape != (frames, PROJECT_TRACK_COUNT):
+            raise TransportError(
+                "Playback destination must have one column per project track."
+            )
+        destination.fill(0)
+        return destination
+
     def stop(self) -> None:
         """Stop, drain recorded blocks, flush the project, and retain position."""
         self.record_armed = False
         self.mode = TransportMode.STOPPED
-        self._stop_event.set()
-        worker = self._worker
-        if worker is not None:
-            worker.join(timeout=5.0)
-            if worker.is_alive():
-                self._fail("Timed out while finishing the recording.")
-        self._worker = None
-        self._worker_mode = TransportMode.STOPPED
+        if not self._finish_workers(timeout=5.0):
+            self._fail("Timed out while finishing the recording.")
         self._current_playback = None
         self._current_offset = 0
         self._drain_queue(self._playback_queue)
-        try:
-            self.project.flush_audio()
-        except ProjectError as exc:
-            self._fail(str(exc))
+        if self._capture_worker_thread is None:
+            try:
+                self.project.flush_audio()
+            except ProjectError as exc:
+                self._fail(str(exc))
 
     def return_to_zero(self) -> None:
         """Return the stopped transport to the first project frame."""
@@ -383,6 +532,7 @@ class TransportController:
                 except Empty:
                     break
                 self._current_offset = 0
+                self._playback_space_event.set()
             available = len(self._current_playback.data) - self._current_offset
             amount = min(len(destination) - copied, available)
             destination[copied : copied + amount] = self._current_playback.data[
@@ -394,67 +544,136 @@ class TransportController:
                 self._current_playback = None
         return copied
 
-    def _disk_worker(self) -> None:
-        last_flush = monotonic()
+    def _finish_workers(self, timeout: float) -> bool:
+        """Signal both disk workers and close their playback handle."""
+        self._stop_event.set()
+        self._capture_queue.wake()
+        self._playback_space_event.set()
+        workers = (
+            self._capture_worker_thread,
+            self._playback_worker_thread,
+        )
+        for worker in workers:
+            if worker is not None:
+                worker.join(timeout=timeout)
+        all_stopped = not any(
+            worker is not None and worker.is_alive() for worker in workers
+        )
+        if (
+            self._capture_worker_thread is not None
+            and not self._capture_worker_thread.is_alive()
+        ):
+            self._capture_worker_thread = None
+        if (
+            self._playback_worker_thread is not None
+            and not self._playback_worker_thread.is_alive()
+        ):
+            self._playback_worker_thread = None
+            reader = self._playback_reader
+            self._playback_reader = None
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception as exc:
+                    self._fail(f"Unable to close project playback: {exc}")
+        if all_stopped:
+            self._worker_mode = TransportMode.STOPPED
+        return all_stopped
+
+    def _playback_worker_main(self, reader: soundfile.SoundFile) -> None:
         try:
-            while not self._stop_event.is_set() or not self._capture_queue.empty():
-                wrote_capture = self._write_next_capture()
-                if not self._stop_event.is_set():
-                    self._fill_playback_queue()
-                if monotonic() - last_flush >= 1.0:
-                    self.project.flush_audio()
-                    last_flush = monotonic()
-                if not wrote_capture:
-                    self._stop_event.wait(0.002)
-            self.project.flush_audio()
+            while not self._stop_event.is_set():
+                if self._worker_mode.shuttling:
+                    complete = self._fill_shuttle_queue(
+                        self._worker_mode, reader
+                    )
+                else:
+                    complete = self._fill_playback_queue(reader)
+                if complete:
+                    return
+                self._playback_space_event.wait(timeout=0.05)
+                self._playback_space_event.clear()
         except Exception as exc:
-            self._fail(f"Project disk operation failed: {exc}")
+            self._fail(f"Project playback operation failed: {exc}")
         finally:
             self._ready_event.set()
 
-    def _write_next_capture(self) -> bool:
+    def _capture_worker_main(self) -> None:
+        last_checkpoint = monotonic()
+        dirty = False
         try:
-            capture = self._capture_queue.get_nowait()
-        except Empty:
-            return False
+            while not self._stop_event.is_set() or not self._capture_queue.empty():
+                batch = self._capture_queue.wait_for_batch(
+                    CAPTURE_BATCH_FRAMES,
+                    CAPTURE_COALESCE_SECONDS,
+                    self._stop_event,
+                )
+                if batch:
+                    self._write_capture_batch(batch)
+                    dirty = True
+                now = monotonic()
+                if (
+                    dirty
+                    and self._capture_queue.empty()
+                    and now - last_checkpoint >= RECORDING_CHECKPOINT_SECONDS
+                ):
+                    self.project.flush_audio()
+                    dirty = False
+                    last_checkpoint = now
+        except Exception as exc:
+            self._fail(f"Project recording operation failed: {exc}")
+
+    def _write_capture_batch(self, batch: Sequence[CaptureBlock]) -> None:
+        first = batch[0]
+        if len(batch) == 1:
+            input_data = first.input_data
+            stereo_bus = first.stereo_bus
+        else:
+            input_data = np.concatenate(
+                tuple(block.input_data for block in batch), axis=0
+            )
+            stereo_bus = np.concatenate(
+                tuple(block.stereo_bus for block in batch), axis=0
+            )
         self.project.write_recording_block(
-            capture.position,
-            capture.input_data,
-            capture.stereo_bus,
+            first.position,
+            input_data,
+            stereo_bus,
             self._track_inputs,
-            capture.armed_tracks,
+            first.armed_tracks,
         )
         self._known_frames = max(
-            self._known_frames, capture.position + len(capture.input_data)
+            self._known_frames, first.position + len(input_data)
         )
-        return True
 
-    def _fill_playback_queue(self) -> None:
-        if self._worker_mode.shuttling:
-            self._fill_shuttle_queue(self._worker_mode)
-            return
+    def _fill_playback_queue(self, reader: soundfile.SoundFile) -> bool:
         while not self._playback_queue.full():
             if self._read_cursor >= self._playback_end_frames:
                 self._ready_event.set()
-                return
+                return True
             read_frames = min(
                 DISK_BLOCK_FRAMES,
                 self._playback_end_frames - self._read_cursor,
             )
-            block = self.project.read_audio_block(self._read_cursor, read_frames)
+            block = self.project.read_audio_block(
+                self._read_cursor, read_frames, audio_file=reader
+            )
             self._playback_queue.put_nowait(
                 PlaybackBlock(self._read_cursor, block)
             )
             self._read_cursor += len(block)
-            self._ready_event.set()
+            self._mark_prebuffered(len(block))
+        return False
 
-    def _fill_shuttle_queue(self, mode: TransportMode) -> None:
+    def _fill_shuttle_queue(
+        self, mode: TransportMode, reader: soundfile.SoundFile
+    ) -> bool:
         while not self._playback_queue.full():
             if mode is TransportMode.FAST_FORWARD:
                 remaining = self._playback_end_frames - self._read_cursor
                 if remaining <= 0:
                     self._ready_event.set()
-                    return
+                    return True
                 output_frames = min(
                     SHUTTLE_OUTPUT_BLOCK_FRAMES,
                     (remaining + SHUTTLE_SPEED - 1) // SHUTTLE_SPEED,
@@ -471,7 +690,7 @@ class TransportController:
                 remaining = self._read_cursor
                 if remaining <= 0:
                     self._ready_event.set()
-                    return
+                    return True
                 output_frames = min(
                     SHUTTLE_OUTPUT_BLOCK_FRAMES,
                     (remaining + SHUTTLE_SPEED - 1) // SHUTTLE_SPEED,
@@ -484,14 +703,22 @@ class TransportController:
                     0, self._read_cursor - output_frames * SHUTTLE_SPEED
                 )
 
-            block = self._filtered_shuttle_samples(indices)
+            block = self._filtered_shuttle_samples(indices, reader)
             block *= SHUTTLE_GAIN
             self._playback_queue.put_nowait(
                 PlaybackBlock(block_position, block)
             )
+            self._mark_prebuffered(len(block))
+        return False
+
+    def _mark_prebuffered(self, frames: int) -> None:
+        self._prebuffered_frames += frames
+        if self._prebuffered_frames >= self._prebuffer_target_frames:
             self._ready_event.set()
 
-    def _filtered_shuttle_samples(self, indices: np.ndarray) -> np.ndarray:
+    def _filtered_shuttle_samples(
+        self, indices: np.ndarray, reader: soundfile.SoundFile
+    ) -> np.ndarray:
         half_taps = SHUTTLE_FILTER_TAPS // 2
         read_start = int(indices.min()) - half_taps
         read_end = int(indices.max()) + half_taps + 1
@@ -502,7 +729,9 @@ class TransportController:
         available_end = min(self._playback_end_frames, read_end)
         if available_end > available_start:
             available = self.project.read_audio_block(
-                available_start, available_end - available_start
+                available_start,
+                available_end - available_start,
+                audio_file=reader,
             )
             offset = available_start - read_start
             source[offset : offset + len(available)] = available

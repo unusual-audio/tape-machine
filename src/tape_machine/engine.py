@@ -10,6 +10,7 @@ import numpy as np
 import sounddevice
 
 from tape_machine.audio import (
+    PROJECT_TRACK_COUNT,
     STEREO_BUS_CHANNEL_COUNT,
     AudioDevice,
     AudioSettings,
@@ -44,7 +45,10 @@ class TransportAudioSource(Protocol):
     """Real-time transport interface consumed by the stream callback."""
 
     def prepare_audio(
-        self, frames: int, status: object
+        self,
+        frames: int,
+        status: object,
+        destination: np.ndarray | None = None,
     ) -> tuple[np.ndarray | None, object | None]: ...
 
     def submit_capture(
@@ -197,6 +201,15 @@ class AudioEngine:
         self._playback_bus_matrix = np.zeros((8, 2), dtype=np.float32)
         self._bus_output_matrix = np.zeros((2, 1), dtype=np.float32)
         self._transport: TransportAudioSource | None = None
+        self._stereo_bus_scratch = np.zeros(
+            (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
+        self._playback_bus_scratch = np.zeros(
+            (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
+        self._track_playback_scratch = np.zeros(
+            (0, PROJECT_TRACK_COUNT), dtype=np.float32
+        )
 
     @property
     def running(self) -> bool:
@@ -273,6 +286,7 @@ class AudioEngine:
         self._monitor_bus_matrix = np.zeros((1, 2), dtype=np.float32)
         self._playback_bus_matrix = np.zeros((8, 2), dtype=np.float32)
         self._bus_output_matrix = np.zeros((2, 1), dtype=np.float32)
+        self._reset_audio_scratch()
         if failed_stream is not None:
             try:
                 failed_stream.close()
@@ -312,6 +326,7 @@ class AudioEngine:
         self._monitor_bus_matrix = np.zeros((1, 2), dtype=np.float32)
         self._playback_bus_matrix = np.zeros((8, 2), dtype=np.float32)
         self._bus_output_matrix = np.zeros((2, 1), dtype=np.float32)
+        self._reset_audio_scratch()
         if stream is None:
             return
         try:
@@ -340,9 +355,10 @@ class AudioEngine:
             frames, self._output_channels
         )
         monitor_bus_matrix = self._monitor_bus_matrix
-        stereo_bus = np.zeros(
-            (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        stereo_bus, playback_bus, track_playback = self._audio_scratch(
+            frames
         )
+        stereo_bus.fill(0)
         outdata.fill(0)
         if monitor_bus_matrix.shape == (
             indata.shape[1],
@@ -352,13 +368,18 @@ class AudioEngine:
         transport = self._transport
         capture_context: object | None = None
         if transport is not None:
-            playback, capture_context = transport.prepare_audio(frames, status)
+            playback, capture_context = transport.prepare_audio(
+                frames, status, track_playback
+            )
             playback_bus_matrix = self._playback_bus_matrix
             if (
                 playback is not None
                 and playback.shape[1] == playback_bus_matrix.shape[0]
             ):
-                stereo_bus += playback @ playback_bus_matrix
+                np.matmul(
+                    playback, playback_bus_matrix, out=playback_bus
+                )
+                stereo_bus += playback_bus
         np.clip(stereo_bus, -1.0, 1.0, out=stereo_bus)
         bus_output_matrix = self._bus_output_matrix
         if bus_output_matrix.shape == (
@@ -369,6 +390,37 @@ class AudioEngine:
         if transport is not None and capture_context is not None:
             transport.submit_capture(capture_context, indata, stereo_bus)
         np.clip(outdata, -1.0, 1.0, out=outdata)
+
+    def _audio_scratch(
+        self, frames: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return reusable callback buffers sized for the current block."""
+        if len(self._stereo_bus_scratch) < frames:
+            self._stereo_bus_scratch = np.zeros(
+                (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+            )
+            self._playback_bus_scratch = np.zeros(
+                (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+            )
+            self._track_playback_scratch = np.zeros(
+                (frames, PROJECT_TRACK_COUNT), dtype=np.float32
+            )
+        return (
+            self._stereo_bus_scratch[:frames],
+            self._playback_bus_scratch[:frames],
+            self._track_playback_scratch[:frames],
+        )
+
+    def _reset_audio_scratch(self) -> None:
+        self._stereo_bus_scratch = np.zeros(
+            (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
+        self._playback_bus_scratch = np.zeros(
+            (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
+        self._track_playback_scratch = np.zeros(
+            (0, PROJECT_TRACK_COUNT), dtype=np.float32
+        )
 
 
 def _is_transient_core_audio_error(exc: Exception) -> bool:

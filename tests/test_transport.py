@@ -1,18 +1,25 @@
 """Tests for project playback, punch recording, and transport position."""
 
 from pathlib import Path
+from queue import Full
+from threading import Event
 from time import sleep
 
 import numpy as np
 import pytest
 
+import tape_machine.transport as transport_module
 from tape_machine.audio import StereoBusInput
 from tape_machine.project import AudioProject, ProjectMetadata
 from tape_machine.transport import (
+    CAPTURE_BUFFER_SECONDS,
+    CaptureBlock,
+    CaptureContext,
     SHUTTLE_GAIN,
     SHUTTLE_SPEED,
     TransportController,
     TransportMode,
+    _CaptureBuffer,
     format_transport_time,
 )
 
@@ -413,3 +420,151 @@ def test_live_punch_after_rolling_through_silence_extends_project(
     assert not recorded[2:5].any()
     assert recorded[5:, 0] == pytest.approx([0.5] * 3, abs=1e-6)
     project.close()
+
+
+def test_capture_capacity_is_three_seconds_at_project_sample_rate(
+    tmp_path: Path,
+) -> None:
+    project = AudioProject.create(
+        tmp_path / "capacity.wav", 44_100, ProjectMetadata()
+    )
+    transport = TransportController(project)
+
+    assert transport._capture_queue.max_frames == round(
+        44_100 * CAPTURE_BUFFER_SECONDS
+    )
+    project.close()
+
+
+def test_capture_buffer_uses_frame_budget_and_batches_compatible_blocks() -> None:
+    capture_buffer = _CaptureBuffer(max_frames=32)
+    first_mask = (True,) + (False,) * 7
+    second_mask = (False, True) + (False,) * 6
+
+    def block(position: int, frames: int, mask: tuple[bool, ...]) -> CaptureBlock:
+        return CaptureBlock(
+            position,
+            np.zeros((frames, 1), dtype=np.float32),
+            np.zeros((frames, 2), dtype=np.float32),
+            mask,
+        )
+
+    capture_buffer.put_nowait(block(0, 2, first_mask))
+    capture_buffer.put_nowait(block(2, 3, first_mask))
+    capture_buffer.put_nowait(block(5, 2, second_mask))
+    with pytest.raises(Full):
+        capture_buffer.put_nowait(block(7, 26, second_mask))
+
+    batch = capture_buffer.wait_for_batch(8, 0, Event())
+
+    assert [item.position for item in batch] == [0, 2]
+    assert capture_buffer.buffered_frames == 2
+    assert capture_buffer.get_nowait().armed_tracks == second_mask
+
+
+def test_capture_overflow_reports_the_duration_of_the_safety_buffer(
+    tmp_path: Path,
+) -> None:
+    project = AudioProject.create(
+        tmp_path / "overflow.wav", 48_000, ProjectMetadata()
+    )
+    transport = TransportController(project)
+    transport._capture_queue = _CaptureBuffer(max_frames=1)
+    context = CaptureContext(0, 2, (True,) + (False,) * 7)
+
+    transport.submit_capture(
+        context,
+        np.zeros((2, 1), dtype=np.float32),
+        np.zeros((2, 2), dtype=np.float32),
+    )
+
+    assert transport.terminal_error == (
+        "Recording buffer overflowed after 3 seconds; "
+        "storage could not keep up."
+    )
+    project.close()
+
+
+def test_playback_uses_an_independent_reader_and_supplied_destination(
+    tmp_path: Path,
+) -> None:
+    audio = np.full((4, 8), 0.25, dtype=np.float32)
+    project = project_with_audio(tmp_path, audio)
+    transport = TransportController(project)
+
+    assert transport.play(TRACK_INPUTS, (False,) * 8)
+    reader = transport._playback_reader
+    destination = np.full((4, 8), 99, dtype=np.float32)
+    playback, _ = transport.prepare_audio(4, None, destination)
+
+    assert reader is not None
+    assert reader is not project.audio_file
+    assert playback is destination
+    assert playback == pytest.approx(audio, abs=1e-6)
+    transport.stop()
+    assert reader.closed
+    project.close()
+
+
+def test_recording_checkpoint_waits_until_capture_backlog_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mask = (True,) + (False,) * 7
+
+    def block(position: int) -> CaptureBlock:
+        return CaptureBlock(
+            position,
+            np.zeros((2, 1), dtype=np.float32),
+            np.zeros((2, 2), dtype=np.float32),
+            mask,
+        )
+
+    class FakeProject:
+        frames = 0
+        sample_rate = 48_000
+
+        def __init__(self) -> None:
+            self.writes: list[int] = []
+            self.flushes = 0
+
+        def write_recording_block(
+            self,
+            position: int,
+            input_data: np.ndarray,
+            stereo_bus: np.ndarray,
+            track_inputs: tuple[object, ...],
+            armed_tracks: tuple[bool, ...],
+        ) -> None:
+            self.writes.append(position)
+
+        def flush_audio(self) -> None:
+            self.flushes += 1
+
+    class ScriptedBuffer:
+        def __init__(self) -> None:
+            self.batches = [(block(0),), (block(2),)]
+
+        def empty(self) -> bool:
+            return not self.batches
+
+        def wait_for_batch(
+            self,
+            target_frames: int,
+            coalesce_seconds: float,
+            stop_event: Event,
+        ) -> tuple[CaptureBlock, ...]:
+            batch = self.batches.pop(0)
+            if not self.batches:
+                stop_event.set()
+            return batch
+
+    project = FakeProject()
+    controller = TransportController(project)  # type: ignore[arg-type]
+    controller._capture_queue = ScriptedBuffer()  # type: ignore[assignment]
+    times = iter((0.0, 6.0, 6.0))
+    monkeypatch.setattr(transport_module, "monotonic", lambda: next(times))
+
+    controller._capture_worker_main()
+
+    assert project.writes == [0, 2]
+    assert project.flushes == 1

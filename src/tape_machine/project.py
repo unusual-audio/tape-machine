@@ -291,11 +291,34 @@ class AudioProject:
             self.metadata = metadata
             self.dirty = True
 
-    def read_audio_block(self, position: int, frames: int) -> np.ndarray:
-        """Read an exact float32 block, padding beyond EOF with silence."""
+    def open_playback_reader(self) -> soundfile.SoundFile:
+        """Open an independent read handle for transport playback."""
+        writable = self.writable
         try:
-            self.audio_file.seek(position)
-            return self.audio_file.read(
+            # libsndfile finalizes the RF64 length header when the writer is
+            # closed. Rotate it before opening a concurrent playback reader.
+            self.audio_file.close()
+            self.audio_file = soundfile.SoundFile(
+                self.path, mode="r+" if writable else "r"
+            )
+            return soundfile.SoundFile(self.path, mode="r")
+        except Exception as exc:
+            raise ProjectError(
+                f"Unable to open project audio for playback: {exc}"
+            ) from exc
+
+    def read_audio_block(
+        self,
+        position: int,
+        frames: int,
+        *,
+        audio_file: soundfile.SoundFile | None = None,
+    ) -> np.ndarray:
+        """Read an exact float32 block, padding beyond EOF with silence."""
+        reader = self.audio_file if audio_file is None else audio_file
+        try:
+            reader.seek(position)
+            return reader.read(
                 frames,
                 dtype="float32",
                 always_2d=True,
@@ -321,6 +344,8 @@ class AudioProject:
             raise ProjectError("Recording requires exactly eight project tracks.")
         if stereo_bus.shape != (len(input_data), STEREO_BUS_CHANNEL_COUNT):
             raise ProjectError("Recording requires a two-channel stereo bus block.")
+        if position > self.frames:
+            self._extend_with_silence(position)
         block = self.read_audio_block(position, len(input_data))
         for track_index, (input_channel, armed) in enumerate(
             zip(track_inputs, armed_tracks, strict=True)
@@ -345,6 +370,19 @@ class AudioProject:
             self.audio_file.write(block)
         except Exception as exc:
             raise ProjectError(f"Unable to write recorded audio: {exc}") from exc
+
+    def _extend_with_silence(self, target_frames: int) -> None:
+        """Materialize a silent gap before recording beyond the current EOF."""
+        try:
+            self.audio_file.seek(self.frames)
+            remaining = target_frames - self.frames
+            silence = np.zeros((8192, PROJECT_TRACK_COUNT), dtype=np.float32)
+            while remaining > 0:
+                frames = min(remaining, len(silence))
+                self.audio_file.write(silence[:frames])
+                remaining -= frames
+        except Exception as exc:
+            raise ProjectError(f"Unable to extend project audio: {exc}") from exc
 
     def flush_audio(self) -> None:
         """Flush recorded audio and its updated RF64 header to disk."""
