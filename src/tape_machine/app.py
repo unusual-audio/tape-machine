@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Callable
 
 import toga
-from rubicon.objc import NSObject, ObjCClass, objc_method
-from toga.style.pack import CENTER, COLUMN, ROW
+from rubicon.objc import NSObject, ObjCClass, objc_const, objc_method
+from rubicon.objc.runtime import load_library
+from toga.style.pack import CENTER, COLUMN, END, ROW
 from toga_cocoa.libs import NSCursor
 
 from tape_machine.audio import (
@@ -43,7 +44,8 @@ from tape_machine.transport import (
 
 
 _TRANSPORT_BUTTON_WIDTH = 80
-_MAIN_WINDOW_SIZE = (912, 560)
+_TRANSPORT_BAR_WIDTH = 880
+_MAIN_WINDOW_SIZE = (912, 584)
 _AUDIO_SETTINGS_WINDOW_SIZE = (900, 640)
 _RECORD_BUTTON_TEXT = "● REC"
 _REWIND_BUTTON_TEXT = "◀◀ REW"
@@ -52,6 +54,8 @@ _RTZ_BUTTON_TEXT = "⇤ RTZ"
 _STOP_BUTTON_TEXT = "■ STOP"
 _FAST_FORWARD_BUTTON_TEXT = "▶▶ FWD"
 _NSTRACKING_IN_VISIBLE_RECT = 0x200
+_NUMBER_SPACING_FEATURE_TYPE = 6
+_TABULAR_NUMBERS_SELECTOR = 0
 
 
 class RoutingStatusCursorOwner(NSObject):
@@ -60,6 +64,36 @@ class RoutingStatusCursorOwner(NSObject):
     @objc_method
     def cursorUpdate_(self, event) -> None:
         NSCursor.pointingHandCursor.set()
+
+
+def _tabular_number_font(font: object) -> object:
+    """Enable tabular figures while preserving the font's family and traits."""
+    from toga_cocoa.libs import NSMutableArray, NSMutableDictionary, NSFont
+
+    appkit = load_library("AppKit")
+    settings_key = objc_const(appkit, "NSFontFeatureSettingsAttribute")
+    type_key = objc_const(appkit, "NSFontFeatureTypeIdentifierKey")
+    selector_key = objc_const(
+        appkit, "NSFontFeatureSelectorIdentifierKey"
+    )
+
+    feature = NSMutableDictionary.alloc().init()
+    feature[type_key] = _NUMBER_SPACING_FEATURE_TYPE
+    feature[selector_key] = _TABULAR_NUMBERS_SELECTOR
+    features = NSMutableArray.alloc().init()
+    features.addObject(feature)
+    attributes = NSMutableDictionary.alloc().init()
+    attributes[settings_key] = features
+    descriptor = font.fontDescriptor.fontDescriptorByAddingAttributes(
+        attributes
+    )
+    return NSFont.fontWithDescriptor(descriptor, size=font.pointSize)
+
+
+def _style_time_counter(label: toga.Label) -> None:
+    """Apply stable-width tabular numerals to the proportional time font."""
+    native = label._impl.native
+    native.font = _tabular_number_font(native.font)
 
 
 def _fit_window_position(
@@ -457,6 +491,7 @@ class TapeMachine(toga.App):
             margin_left=10,
             margin_top=4,
         )
+        _style_time_counter(self.transport_time_label)
         transport_bar = toga.Box(
             children=[
                 self.transport_record_button,
@@ -468,7 +503,8 @@ class TapeMachine(toga.App):
             ],
             direction=ROW,
             align_items=CENTER,
-            justify_content=CENTER,
+            justify_content=END,
+            width=_TRANSPORT_BAR_WIDTH,
             gap=6,
             margin_bottom=2,
         )

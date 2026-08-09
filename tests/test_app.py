@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from tape_machine.app import ShuttleButton, TapeMachine, _fit_window_position
+from tape_machine.app import (
+    ShuttleButton,
+    TapeMachine,
+    _fit_window_position,
+    _tabular_number_font,
+)
 from tape_machine.audio import (
     AudioDevice,
     AudioSettings,
@@ -116,6 +121,29 @@ def summary_app(settings: AudioSettings | None) -> SimpleNamespace:
         app, "routing_status_link_visible", visible
     )
     return app
+
+
+def test_time_counter_uses_tabular_figures_in_a_proportional_font() -> None:
+    from toga_cocoa.libs import (
+        NSMutableDictionary,
+        NSAttributedString,
+        NSFont,
+        NSFontAttributeName,
+    )
+
+    font = _tabular_number_font(NSFont.boldSystemFontOfSize(18))
+    attributes = NSMutableDictionary.alloc().init()
+    attributes[NSFontAttributeName] = font
+
+    def width(text: str) -> float:
+        attributed = NSAttributedString.alloc().initWithString(
+            text, attributes=attributes
+        )
+        return attributed.size().width
+
+    assert font.isFixedPitch() is False
+    assert width("11:11.111") == pytest.approx(width("88:88.888"))
+    assert width("00:00.000") == pytest.approx(width("12:34.567"))
 
 
 def test_status_line_marks_incomplete_routing() -> None:
