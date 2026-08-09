@@ -2,24 +2,27 @@
 
 from pathlib import Path
 from queue import Full
-from threading import Event
+from threading import Event, Thread
 from time import sleep
 
 import numpy as np
 import pytest
+import soundfile
 
 import tape_machine.transport as transport_module
 from tape_machine.audio import StereoBusInput
 from tape_machine.project import AudioProject, ProjectMetadata
 from tape_machine.transport import (
     CAPTURE_BUFFER_SECONDS,
-    CaptureBlock,
     CaptureContext,
     SHUTTLE_GAIN,
     SHUTTLE_SPEED,
     TransportController,
+    TransportError,
+    TransportLifecycle,
     TransportMode,
-    _CaptureBuffer,
+    _CaptureRing,
+    _CaptureRingBatch,
     format_transport_time,
 )
 
@@ -216,7 +219,7 @@ def test_shuttle_disarms_global_record_without_changing_tracks_or_audio(
     assert transport.record_armed is False
     assert transport.armed_tracks == armed_tracks
     transport.process_audio(np.ones((2, 2), np.float32), 2, None)
-    assert transport._capture_queue.empty()
+    assert transport._capture_ring.empty()
     transport.stop()
     assert project.read_audio_block(0, 100) == pytest.approx(
         original, abs=1e-6
@@ -394,9 +397,10 @@ def test_capture_block_keeps_callback_arm_mask_after_ui_changes(
 
     transport.process_audio(np.ones((1, 2), np.float32), 1, None)
     transport.set_armed_tracks((False, True) + (False,) * 6)
-    capture = transport._capture_queue.get_nowait()
+    batch = transport._capture_ring.wait_for_batch(8, 0, Event())
 
-    assert capture.armed_tracks == callback_mask
+    assert batch is not None
+    assert batch.armed_mask == 1
     transport.running = False
     project.close()
 
@@ -430,36 +434,41 @@ def test_capture_capacity_is_three_seconds_at_project_sample_rate(
     )
     transport = TransportController(project)
 
-    assert transport._capture_queue.max_frames == round(
+    assert transport._capture_ring.max_frames == round(
         44_100 * CAPTURE_BUFFER_SECONDS
     )
     project.close()
 
 
-def test_capture_buffer_uses_frame_budget_and_batches_compatible_blocks() -> None:
-    capture_buffer = _CaptureBuffer(max_frames=32)
+def test_capture_ring_uses_frame_budget_and_batches_compatible_blocks() -> None:
+    capture_ring = _CaptureRing(max_frames=32)
     first_mask = (True,) + (False,) * 7
     second_mask = (False, True) + (False,) * 6
+    routes = (0, 1) + (None,) * 6
 
-    def block(position: int, frames: int, mask: tuple[bool, ...]) -> CaptureBlock:
-        return CaptureBlock(
+    def put(position: int, frames: int, mask: tuple[bool, ...]) -> None:
+        capture_ring.put_routed_nowait(
             position,
             np.zeros((frames, 1), dtype=np.float32),
             np.zeros((frames, 2), dtype=np.float32),
+            routes,
             mask,
         )
 
-    capture_buffer.put_nowait(block(0, 2, first_mask))
-    capture_buffer.put_nowait(block(2, 3, first_mask))
-    capture_buffer.put_nowait(block(5, 2, second_mask))
+    put(0, 2, first_mask)
+    put(2, 3, first_mask)
+    put(5, 2, second_mask)
     with pytest.raises(Full):
-        capture_buffer.put_nowait(block(7, 26, second_mask))
+        put(7, 26, second_mask)
 
-    batch = capture_buffer.wait_for_batch(8, 0, Event())
+    batch = capture_ring.wait_for_batch(8, 0, Event())
 
-    assert [item.position for item in batch] == [0, 2]
-    assert capture_buffer.buffered_frames == 2
-    assert capture_buffer.get_nowait().armed_tracks == second_mask
+    assert batch == _CaptureRingBatch(0, 5, 2, 1)
+    capture_ring.release(batch)
+    assert capture_ring.buffered_frames == 2
+    next_batch = capture_ring.wait_for_batch(8, 0, Event())
+    assert next_batch is not None
+    assert next_batch.armed_mask == 2
 
 
 def test_capture_overflow_reports_the_duration_of_the_safety_buffer(
@@ -469,7 +478,7 @@ def test_capture_overflow_reports_the_duration_of_the_safety_buffer(
         tmp_path / "overflow.wav", 48_000, ProjectMetadata()
     )
     transport = TransportController(project)
-    transport._capture_queue = _CaptureBuffer(max_frames=1)
+    transport._capture_ring = _CaptureRing(max_frames=1)
     context = CaptureContext(0, 2, (True,) + (False,) * 7)
 
     transport.submit_capture(
@@ -511,14 +520,6 @@ def test_recording_checkpoint_waits_until_capture_backlog_is_empty(
 ) -> None:
     mask = (True,) + (False,) * 7
 
-    def block(position: int) -> CaptureBlock:
-        return CaptureBlock(
-            position,
-            np.zeros((2, 1), dtype=np.float32),
-            np.zeros((2, 2), dtype=np.float32),
-            mask,
-        )
-
     class FakeProject:
         frames = 0
         sample_rate = 48_000
@@ -527,12 +528,10 @@ def test_recording_checkpoint_waits_until_capture_backlog_is_empty(
             self.writes: list[int] = []
             self.flushes = 0
 
-        def write_recording_block(
+        def write_routed_recording_block(
             self,
             position: int,
-            input_data: np.ndarray,
-            stereo_bus: np.ndarray,
-            track_inputs: tuple[object, ...],
+            track_data: np.ndarray,
             armed_tracks: tuple[bool, ...],
         ) -> None:
             self.writes.append(position)
@@ -542,7 +541,10 @@ def test_recording_checkpoint_waits_until_capture_backlog_is_empty(
 
     class ScriptedBuffer:
         def __init__(self) -> None:
-            self.batches = [(block(0),), (block(2),)]
+            self.batches = [
+                _CaptureRingBatch(0, 2, 1, 1),
+                _CaptureRingBatch(2, 2, 1, 1),
+            ]
 
         def empty(self) -> bool:
             return not self.batches
@@ -552,15 +554,21 @@ def test_recording_checkpoint_waits_until_capture_backlog_is_empty(
             target_frames: int,
             coalesce_seconds: float,
             stop_event: Event,
-        ) -> tuple[CaptureBlock, ...]:
+        ) -> _CaptureRingBatch | None:
             batch = self.batches.pop(0)
             if not self.batches:
                 stop_event.set()
             return batch
 
+        def views(self, batch: _CaptureRingBatch) -> tuple[np.ndarray, ...]:
+            return (np.zeros((batch.frames, 8), dtype=np.float32),)
+
+        def release(self, batch: _CaptureRingBatch) -> None:
+            pass
+
     project = FakeProject()
     controller = TransportController(project)  # type: ignore[arg-type]
-    controller._capture_queue = ScriptedBuffer()  # type: ignore[assignment]
+    controller._capture_ring = ScriptedBuffer()  # type: ignore[assignment]
     times = iter((0.0, 6.0, 6.0))
     monkeypatch.setattr(transport_module, "monotonic", lambda: next(times))
 
@@ -568,3 +576,79 @@ def test_recording_checkpoint_waits_until_capture_backlog_is_empty(
 
     assert project.writes == [0, 2]
     assert project.flushes == 1
+
+
+def test_worker_timeout_keeps_transport_faulted_until_late_exit(
+    tmp_path: Path,
+) -> None:
+    project = project_with_audio(tmp_path, np.zeros((4, 8), np.float32))
+    transport = TransportController(project)
+
+    class LateWorker:
+        alive = True
+
+        def join(self, timeout: float = 0) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    worker = LateWorker()
+    transport.mode = TransportMode.PLAYING
+    transport.lifecycle = TransportLifecycle.RUNNING
+    transport._capture_worker_thread = worker  # type: ignore[assignment]
+
+    transport.stop()
+
+    assert transport.mode is TransportMode.STOPPED
+    assert transport.lifecycle is TransportLifecycle.FAULTED
+    assert transport.busy is True
+    with pytest.raises(TransportError, match="previous transport operation"):
+        transport.play(TRACK_INPUTS, (False,) * 8)
+
+    worker.alive = False
+    transport.poll_lifecycle()
+
+    assert transport.lifecycle is TransportLifecycle.IDLE
+    assert transport.busy is False
+    project.close()
+
+
+def test_partial_worker_start_can_be_cleaned_up_without_joining_error(
+    tmp_path: Path,
+) -> None:
+    project = project_with_audio(tmp_path, np.zeros((1, 8), np.float32))
+    transport = TransportController(project)
+    reader = project.open_playback_reader()
+    transport._playback_reader = reader
+    transport._playback_worker_thread = Thread(target=lambda: None)
+
+    assert transport._finish_workers(timeout=0) is True
+    assert transport._playback_worker_thread is None
+    assert reader.closed
+    project.close()
+
+
+def test_record_start_aborts_if_project_becomes_read_only_during_handle_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = project_with_audio(tmp_path, np.zeros((1, 8), np.float32))
+    transport = TransportController(project)
+    transport.toggle_record()
+    opened_reader: soundfile.SoundFile | None = None
+
+    def lose_write_access() -> soundfile.SoundFile:
+        nonlocal opened_reader
+        project.audio_file.close()
+        project.audio_file = soundfile.SoundFile(project.path, mode="r")
+        opened_reader = soundfile.SoundFile(project.path, mode="r")
+        return opened_reader
+
+    monkeypatch.setattr(project, "open_playback_reader", lose_write_access)
+
+    with pytest.raises(TransportError, match="became read-only"):
+        transport.play(TRACK_INPUTS, (True,) + (False,) * 7)
+
+    assert transport.lifecycle is TransportLifecycle.IDLE
+    assert opened_reader is not None and opened_reader.closed
+    project.close()

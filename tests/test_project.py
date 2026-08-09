@@ -54,6 +54,46 @@ def test_create_and_reopen_rf64_project(tmp_path: Path) -> None:
     reopened.close()
 
 
+def test_create_failure_preserves_existing_target_and_removes_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "session.wav"
+    path.write_bytes(b"existing project")
+
+    def fail_save(self: AudioProject) -> None:
+        raise ProjectError("metadata write failed")
+
+    monkeypatch.setattr(AudioProject, "save", fail_save)
+
+    with pytest.raises(ProjectError, match="metadata write failed"):
+        AudioProject.create(path, 48_000, ProjectMetadata())
+
+    assert path.read_bytes() == b"existing project"
+    assert list(tmp_path.glob(".session.wav.*.tmp.wav")) == []
+
+
+def test_playback_reader_falls_back_to_read_only_if_write_access_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "session.wav"
+    project = AudioProject.create(path, 48_000, ProjectMetadata())
+    real_sound_file = soundfile.SoundFile
+
+    def open_sound_file(file, mode="r", *args, **kwargs):
+        if Path(file) == path and mode == "r+":
+            raise PermissionError("write access disappeared")
+        return real_sound_file(file, mode=mode, *args, **kwargs)
+
+    monkeypatch.setattr("tape_machine.project.soundfile.SoundFile", open_sound_file)
+
+    reader = project.open_playback_reader()
+
+    assert project.writable is False
+    assert reader.mode == "r"
+    reader.close()
+    project.close()
+
+
 def test_import_untagged_eight_channel_wav_preserves_comment(
     tmp_path: Path,
 ) -> None:
@@ -245,4 +285,25 @@ def test_save_updates_state_only_after_flush_succeeds() -> None:
         project.save(candidate)
 
     assert project.metadata is original
+    assert project.dirty is True
+
+
+def test_mixer_change_during_save_remains_dirty() -> None:
+    original = ProjectMetadata()
+    changed = project_metadata()
+
+    class InterleavingFile:
+        comment = "old"
+        mode = "r+"
+
+        def flush(self) -> None:
+            project.stage_metadata(changed)
+
+    project = AudioProject(
+        Path("project.wav"), InterleavingFile(), original, dirty=True
+    )
+
+    project.save()
+
+    assert project.metadata is changed
     assert project.dirty is True

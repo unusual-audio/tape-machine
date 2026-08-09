@@ -16,7 +16,6 @@ from tape_machine.audio import (
 from tape_machine.config import (
     MAX_RECENT_FILES,
     AppConfig,
-    AppConfigError,
     AppConfigStore,
     StoredAudioSettings,
     WindowPosition,
@@ -25,8 +24,22 @@ from tape_machine.config import (
 
 def stored_audio_settings() -> StoredAudioSettings:
     return StoredAudioSettings(
-        input_device=DeviceReference("Studio Input", "Core Audio"),
-        output_device=DeviceReference("Studio Output", "Core Audio"),
+        input_device=DeviceReference(
+            "Studio Input",
+            "Core Audio",
+            max_input_channels=8,
+            max_output_channels=0,
+            default_sample_rate=48_000,
+            channel_name_signature=("Mic 1", "Mic 2"),
+        ),
+        output_device=DeviceReference(
+            "Studio Output",
+            "Core Audio",
+            max_input_channels=0,
+            max_output_channels=4,
+            default_sample_rate=48_000,
+            channel_name_signature=("Monitor L", "Monitor R"),
+        ),
         sample_rate=96_000,
         track_inputs=(7, 6, 5, 4, 3, 2, 1, 0),
         bus_outputs=(2, 3),
@@ -63,7 +76,7 @@ def test_config_round_trips_stereo_bus_inputs(tmp_path: Path) -> None:
     AppConfigStore(path).save(AppConfig(audio_settings=stored))
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["audio_settings"]["track_inputs"][:2] == [
         "stereo_bus_l",
         "stereo_bus_r",
@@ -86,6 +99,31 @@ def test_invalid_stored_buffer_size_discards_audio_settings(
     assert AppConfigStore(path).load().audio_settings is None
 
 
+def test_invalid_section_resets_only_that_section_and_preserves_backup(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    config = AppConfig(
+        recent_files=(tmp_path / "session.wav",),
+        audio_settings=stored_audio_settings(),
+        main_window_position=WindowPosition(100, 200),
+    )
+    AppConfigStore(path).save(config)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["window_positions"]["main"] = {"x": "broken", "y": 200}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = AppConfigStore(path).load_with_recovery()
+
+    assert result.config.recent_files == config.recent_files
+    assert result.config.audio_settings == config.audio_settings
+    assert result.config.main_window_position is None
+    assert result.recovered_sections == ("recent projects", "audio settings")
+    assert result.reset_sections == ("window positions",)
+    assert result.notice_required is True
+    assert result.backup_path is not None and result.backup_path.exists()
+
+
 def test_recent_files_are_normalized_deduplicated_and_limited(
     tmp_path: Path,
 ) -> None:
@@ -104,18 +142,31 @@ def test_recent_files_are_normalized_deduplicated_and_limited(
     assert config.clear_recent_files().recent_files == ()
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3])
-def test_legacy_config_schemas_are_rejected(
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 99])
+def test_unsupported_config_salvages_known_sections(
     tmp_path: Path, schema_version: int
 ) -> None:
     path = tmp_path / "config.json"
     path.write_text(
-        json.dumps({"schema_version": schema_version}),
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "recent_files": [str(tmp_path / "session.wav")],
+                "audio_settings": None,
+                "window_positions": {"main": {"x": 10, "y": 20}},
+            }
+        ),
         encoding="utf-8",
     )
 
-    with pytest.raises(AppConfigError, match="unsupported version"):
-        AppConfigStore(path).load()
+    result = AppConfigStore(path).load_with_recovery()
+
+    assert result.recovered is True
+    assert result.config.recent_files == ((tmp_path / "session.wav").resolve(),)
+    assert result.config.main_window_position == WindowPosition(10, 20)
+    assert result.backup_path is not None and result.backup_path.exists()
+    assert result.notice_required is False
+    assert json.loads(path.read_text())["schema_version"] == 5
 
 
 @pytest.mark.parametrize(
@@ -127,14 +178,18 @@ def test_legacy_config_schemas_are_rejected(
         '{"schema_version": 99}',
     ],
 )
-def test_invalid_top_level_config_raises_a_readable_error(
+def test_invalid_top_level_config_is_backed_up_and_reset(
     tmp_path: Path, contents: str
 ) -> None:
     path = tmp_path / "config.json"
     path.write_text(contents, encoding="utf-8")
 
-    with pytest.raises(AppConfigError, match="configuration"):
-        AppConfigStore(path).load()
+    result = AppConfigStore(path).load_with_recovery()
+
+    assert result.config == AppConfig()
+    assert result.reset_sections
+    assert result.backup_path is not None and result.backup_path.exists()
+    assert json.loads(path.read_text())["schema_version"] == 5
 
 
 def test_stored_audio_uses_stable_device_references() -> None:

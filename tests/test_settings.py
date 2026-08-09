@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -258,9 +259,12 @@ def test_changing_output_device_preserves_portable_stereo_routing() -> None:
     rebuilt: list[tuple[object, ...]] = []
     window._rebuild_routing_matrices = lambda *args: rebuilt.append(args)
     rate_updates: list[int | None] = []
-    window._update_sample_rates = rate_updates.append
+    async def update_sample_rates(rate: int | None) -> None:
+        rate_updates.append(rate)
 
-    window._on_device_changed(window.output_selection)
+    window._update_sample_rates = update_sample_rates
+
+    asyncio.run(window._on_device_changed(window.output_selection))
 
     assert rebuilt == [
         (
@@ -305,7 +309,7 @@ def test_locked_rate_does_not_probe_an_edited_active_configuration() -> None:
         )
     )
 
-    window._update_sample_rates()
+    asyncio.run(window._update_sample_rates())
 
     assert compatibility_calls == []
     assert window.save_button.enabled is True
@@ -380,11 +384,12 @@ def test_save_applies_settings_and_closes() -> None:
         value=BufferSizeChoice(512)
     )
     window.save_button = SimpleNamespace(enabled=True)
+    window.cancel_button = SimpleNamespace(enabled=True)
     window.status_label = SimpleNamespace(text="")
     window.on_applied = events.append
     window.window = SimpleNamespace(hide=lambda: hides.append(None))
 
-    window._save(SimpleNamespace())
+    asyncio.run(window._save(SimpleNamespace()))
 
     assert events == [settings]
     assert hides == [None]
@@ -414,6 +419,6 @@ def test_open_leaves_an_already_visible_draft_intact() -> None:
     window = AudioSettingsWindow.__new__(AudioSettingsWindow)
     window.window = SimpleNamespace(visible=True)
 
-    window.open()
+    asyncio.run(window.open())
 
     assert window.window.visible is True

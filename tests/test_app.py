@@ -3,6 +3,7 @@
 import asyncio
 import struct
 from pathlib import Path
+from threading import get_ident
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from tape_machine.audio import (
     AudioDevice,
     AudioSettings,
     DeviceReference,
+    RoutingStatus,
     StereoBusInput,
 )
 from tape_machine.config import (
@@ -364,7 +366,7 @@ def test_status_line_handles_missing_audio_configuration() -> None:
     assert app.routing_status_link_visible is True
 
 
-def test_status_line_accepts_mappings_beyond_available_device_channels() -> None:
+def test_status_line_warns_about_mappings_beyond_available_device_channels() -> None:
     app = summary_app(
         AudioSettings(
             1,
@@ -378,7 +380,7 @@ def test_status_line_accepts_mappings_beyond_available_device_channels() -> None
     TapeMachine._update_audio_summary(app)
 
     assert app.status_line_label.text == "Interface  •  48 kHz"
-    assert app.routing_status_link_visible is False
+    assert app.routing_status_link_visible is True
 
 
 def test_status_line_marks_project_audio_engine_failure() -> None:
@@ -415,9 +417,12 @@ def test_status_link_hides_after_entering_a_fully_routed_project() -> None:
 
 def test_routing_status_link_opens_audio_settings() -> None:
     calls: list[None] = []
-    app = SimpleNamespace(preferences=lambda: calls.append(None))
+    async def preferences() -> None:
+        calls.append(None)
 
-    TapeMachine._open_routing_settings(app)
+    app = SimpleNamespace(preferences=preferences)
+
+    asyncio.run(TapeMachine._open_routing_settings(app))
 
     assert calls == [None]
 
@@ -430,17 +435,18 @@ def test_project_preferences_use_global_settings_at_project_rate() -> None:
     active_settings = AudioSettings(
         1, 2, 48_000, tuple(range(8)), (0, 1), 512
     )
+    async def open_settings(draft, **kwargs) -> None:
+        opened.append((draft, kwargs))
+
     app = SimpleNamespace(
         project=SimpleNamespace(sample_rate=48_000),
         audio_service=SimpleNamespace(current_settings=active_settings),
         global_audio_settings=global_settings,
         audio_engine=SimpleNamespace(running=True),
-        settings_window=SimpleNamespace(
-            open=lambda draft, **kwargs: opened.append((draft, kwargs))
-        ),
+        settings_window=SimpleNamespace(open=open_settings),
     )
 
-    TapeMachine.preferences(app)
+    asyncio.run(TapeMachine.preferences(app))
 
     draft, kwargs = opened[0]
     assert draft.buffer_size == 512
@@ -498,6 +504,34 @@ def test_routing_status_link_is_inserted_and_removed_for_state_changes() -> None
     assert removed == [link]
 
 
+def test_routing_status_uses_distinct_degraded_and_incomplete_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    styled: list[str] = []
+    visible: list[bool] = []
+    link = SimpleNamespace(text="", style=SimpleNamespace(color=""))
+    app = SimpleNamespace(
+        _routing_status=RoutingStatus.COMPLETE,
+        routing_status_link=link,
+        _set_routing_status_link_visible=visible.append,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_style_status_link",
+        lambda button, color: styled.append(color),
+    )
+
+    TapeMachine._set_routing_status(app, RoutingStatus.DEGRADED)
+    assert link.text == "Some routes unavailable"
+    assert link.style.color == app_module.ACCENT_ORANGE
+
+    TapeMachine._set_routing_status(app, RoutingStatus.INCOMPLETE)
+    assert link.text == "Routing incomplete"
+    assert link.style.color == app_module.ACCENT_RED
+    assert styled == [app_module.ACCENT_ORANGE, app_module.ACCENT_RED]
+    assert visible == [True, True]
+
+
 def test_mixer_change_rebuilds_running_engine_matrix() -> None:
     calls: list[object] = []
     arm_calls: list[tuple[bool, ...]] = []
@@ -552,7 +586,7 @@ def test_meter_sync_distributes_the_latest_engine_snapshot() -> None:
     assert calls == [(snapshot.track_db, snapshot.bus_db)]
 
 
-def test_audio_failure_stops_engine_and_disables_monitoring() -> None:
+def test_audio_failure_disables_monitoring_after_coordinated_stop() -> None:
     events: list[object] = []
     app = SimpleNamespace(
         audio_engine=SimpleNamespace(stop=lambda: events.append("stop")),
@@ -568,7 +602,7 @@ def test_audio_failure_stops_engine_and_disables_monitoring() -> None:
     TapeMachine._set_audio_engine_failure(app, "Device busy")
 
     assert app.audio_engine_error == "Device busy"
-    assert events == ["stop", False, "summary", "Device busy"]
+    assert events == [False, "summary", "Device busy"]
 
 
 def test_project_audio_settings_persist_globally_after_stream_starts() -> None:
@@ -621,7 +655,7 @@ def test_project_audio_settings_persist_globally_after_stream_starts() -> None:
     app.audio_engine_error = "old error"
     app._update_audio_summary = lambda: view_events.append("summary")
 
-    TapeMachine._project_audio_settings_applied(app, new_settings)
+    asyncio.run(TapeMachine._project_audio_settings_applied(app, new_settings))
 
     assert engine.stop_calls == 2
     assert engine.starts == [new_settings]
@@ -674,7 +708,7 @@ def test_project_audio_settings_clear_input_states_for_removed_route() -> None:
     app.audio_engine_error = None
     app._update_audio_summary = lambda: None
 
-    TapeMachine._project_audio_settings_applied(app, new_settings)
+    asyncio.run(TapeMachine._project_audio_settings_applied(app, new_settings))
 
     saved_track = project.staged[-1].mix.tracks[0]
     assert saved_track.record_enabled is False
@@ -701,7 +735,9 @@ def test_saving_unchanged_project_settings_keeps_active_stream() -> None:
     app.audio_engine_error = None
     app._update_audio_summary = lambda: None
 
-    TapeMachine._project_audio_settings_applied(app, current_settings)
+    asyncio.run(
+        TapeMachine._project_audio_settings_applied(app, current_settings)
+    )
 
     assert service.refresh_calls == 0
     assert service.validate_calls == 0
@@ -727,12 +763,17 @@ def test_failed_candidate_stream_keeps_project_metadata_and_old_settings() -> No
     app.global_audio_settings = old_settings
     app.app_config = AppConfig()
     app.config_store = SimpleNamespace(save=saved_configs.append)
-    app._restore_audio_engine = lambda settings, was_running: True
+    async def restored(settings, was_running) -> bool:
+        return True
+
+    app._restore_audio_engine = restored
     app._set_audio_engine_failure = lambda message, show_dialog=False: None
     app._schedule_audio_engine_dialog = lambda message: dialogs.append(message)
 
     with pytest.raises(AudioEngineError, match="busy"):
-        TapeMachine._project_audio_settings_applied(app, new_settings)
+        asyncio.run(
+            TapeMachine._project_audio_settings_applied(app, new_settings)
+        )
 
     assert project.saved == []
     assert saved_configs == []
@@ -758,7 +799,9 @@ def test_failed_audio_probe_restores_stream_after_stopping_it() -> None:
     app.global_audio_settings = old_settings
     app.app_config = AppConfig()
 
-    def restore(settings: AudioSettings | None, was_running: bool) -> bool:
+    async def restore(
+        settings: AudioSettings | None, was_running: bool
+    ) -> bool:
         restores.append((settings, was_running))
         engine.running = True
         return True
@@ -769,7 +812,9 @@ def test_failed_audio_probe_restores_stream_after_stopping_it() -> None:
     with pytest.raises(
         AudioConfigurationError, match="Core Audio rejected the route"
     ):
-        TapeMachine._project_audio_settings_applied(app, new_settings)
+        asyncio.run(
+            TapeMachine._project_audio_settings_applied(app, new_settings)
+        )
 
     assert engine.stop_calls == 1
     assert engine.running is True
@@ -800,7 +845,9 @@ def test_failed_global_config_save_restores_project_stream_and_settings() -> Non
     app._set_audio_engine_failure = lambda message: None
 
     with pytest.raises(RuntimeError, match="disk full"):
-        TapeMachine._project_audio_settings_applied(app, new_settings)
+        asyncio.run(
+            TapeMachine._project_audio_settings_applied(app, new_settings)
+        )
 
     assert engine.starts == [new_settings, old_settings]
     assert engine.running is True
@@ -835,6 +882,15 @@ def test_project_commands_follow_open_project_state() -> None:
     assert app.settings_command.enabled is True
     assert all(command.enabled is True for command in recent_commands)
 
+    app.project_saving = True
+    TapeMachine._update_command_state(app)
+
+    assert app.new_project_command.enabled is False
+    assert app.open_project_command.enabled is False
+    assert app.settings_command.enabled is False
+    assert all(command.enabled is False for command in recent_commands)
+
+    app.project_saving = False
     app.project = object()
     TapeMachine._update_command_state(app)
 
@@ -850,6 +906,46 @@ def test_project_commands_follow_open_project_state() -> None:
     assert app.save_project_command.enabled is False
     assert app.close_project_command.enabled is False
     assert app.settings_command.enabled is False
+
+
+def test_startup_audio_discovery_runs_off_the_ui_thread() -> None:
+    main_thread = get_ident()
+    discovery_threads: list[int] = []
+    settings = AudioSettings(1, 1, 48_000)
+    updates: list[None] = []
+    shown_notices: list[list[str]] = []
+
+    def discover() -> tuple[AudioSettings, tuple[str, ...]]:
+        discovery_threads.append(get_ident())
+        return settings, ("Confirm the fallback device.",)
+
+    async def show_notices(notices: list[str]) -> None:
+        shown_notices.append(list(notices))
+
+    app = SimpleNamespace(
+        audio_service=SimpleNamespace(current_settings=None),
+        global_audio_settings=None,
+        audio_transitioning=True,
+        audio_initialization_task=object(),
+        _discover_startup_audio=discover,
+        _update_command_state=lambda: updates.append(None),
+        _update_audio_summary=lambda: updates.append(None),
+        _show_startup_notices=show_notices,
+    )
+
+    asyncio.run(
+        TapeMachine._initialize_startup_audio(app, ["Recovered configuration."])
+    )
+
+    assert discovery_threads and discovery_threads[0] != main_thread
+    assert app.audio_service.current_settings == settings
+    assert app.global_audio_settings == settings
+    assert app.audio_transitioning is False
+    assert app.audio_initialization_task is None
+    assert updates == [None, None]
+    assert shown_notices == [
+        ["Recovered configuration.", "Confirm the fallback device."]
+    ]
 
 
 def test_window_position_is_clamped_to_an_attached_screen() -> None:
@@ -888,10 +984,13 @@ def test_save_applies_and_persists_all_global_audio_settings() -> None:
     app.config_store = SimpleNamespace(save=saved.append)
     app.project = None
     app.global_audio_settings = current
+    app.audio_transition_lock = asyncio.Lock()
+    app.audio_transitioning = False
+    app._update_command_state = lambda: None
     summaries: list[None] = []
     app._update_audio_summary = lambda: summaries.append(None)
 
-    TapeMachine._audio_settings_applied(app, candidate)
+    asyncio.run(TapeMachine._audio_settings_applied(app, candidate))
 
     assert service.refresh_calls == 1
     assert service.validate_calls == 1
@@ -922,10 +1021,13 @@ def test_failed_global_config_save_does_not_apply_audio_settings() -> None:
     )
     app.project = None
     app.global_audio_settings = current
+    app.audio_transition_lock = asyncio.Lock()
+    app.audio_transitioning = False
+    app._update_command_state = lambda: None
     app._update_audio_summary = lambda: None
 
     with pytest.raises(RuntimeError, match="disk full"):
-        TapeMachine._audio_settings_applied(app, candidate)
+        asyncio.run(TapeMachine._audio_settings_applied(app, candidate))
 
     assert service.current_settings == current
     assert app.global_audio_settings == current

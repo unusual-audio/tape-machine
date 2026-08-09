@@ -20,6 +20,7 @@ from tape_machine.engine import (
     METER_FLOOR_DB,
     AudioEngine,
     AudioEngineError,
+    EngineFault,
     build_monitor_matrix,
     build_monitor_pre_bus_matrix,
     build_playback_matrix,
@@ -129,7 +130,10 @@ def test_stream_uses_low_latency_adaptive_duplex_configuration() -> None:
     )
 
     assert engine.running is True
-    assert backend.streams[0].kwargs == {
+    stream_kwargs = dict(backend.streams[0].kwargs)
+    finished_callback = stream_kwargs.pop("finished_callback")
+    assert callable(finished_callback)
+    assert stream_kwargs == {
         "samplerate": 48_000,
         "blocksize": 0,
         "device": (1, 2),
@@ -144,6 +148,56 @@ def test_stream_uses_low_latency_adaptive_duplex_configuration() -> None:
     assert engine.running is False
     assert backend.streams[0].stop_calls == 1
     assert backend.streams[0].closed is True
+
+
+def test_unexpected_stream_finish_is_exposed_as_engine_health() -> None:
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.start(settings(), monitored_state(0), device(index=1), device(index=2))
+
+    backend.streams[0].kwargs["finished_callback"]()
+
+    assert engine.health_snapshot.fault is EngineFault.STREAM_FINISHED
+    engine.stop()
+    assert engine.health_snapshot.fault is None
+
+
+def test_callback_failure_is_silenced_and_published_as_engine_health() -> None:
+    class FailingTransport:
+        def render_audio(
+            self, frames: int, status: object, destination: np.ndarray
+        ) -> object:
+            raise RuntimeError("transport callback failed")
+
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.set_transport(FailingTransport())
+    engine.start(settings(), monitored_state(0), device(index=1), device(index=2))
+    callback = backend.streams[0].kwargs["callback"]
+    outdata = np.ones((4, 2), dtype=np.float32)
+
+    callback(np.ones((4, 1), dtype=np.float32), outdata, 4, None, None)
+
+    assert not outdata.any()
+    assert engine.health_snapshot.fault is EngineFault.CALLBACK
+    assert engine.health_snapshot.message == "transport callback failed"
+
+
+def test_callback_splits_oversized_host_blocks_across_fixed_scratch() -> None:
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    state = monitored_state(0)
+    state.tracks[0].pan = -1
+    engine.start(settings(), state, device(index=1), device(index=2))
+    callback = backend.streams[0].kwargs["callback"]
+    indata = np.full((9_000, 1), 0.25, dtype=np.float32)
+    outdata = np.zeros((9_000, 2), dtype=np.float32)
+
+    callback(indata, outdata, 9_000, None, None)
+
+    assert outdata[:, 0] == pytest.approx(np.full(9_000, 0.25))
+    assert not outdata[:, 1].any()
+    assert engine.health_snapshot.fault is None
 
 
 def test_stream_start_failure_is_descriptive_and_closes_stream() -> None:

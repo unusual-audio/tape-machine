@@ -38,7 +38,7 @@ configuration in the WAV comment metadata. Audio devices, routing, and buffer si
 remain global and are never written to a project. Untagged eight-channel WAV files
 can be imported and tagged when saved.
 
-**File → Open Recent** keeps the ten most recently created or opened projects.
+**File → Open Recent** keeps the fourteen most recently created or opened projects.
 Selecting a missing file removes it from the menu, and **Clear Menu** removes the
 entire history.
 
@@ -83,6 +83,11 @@ Project playback passes through the live fader, pan, mute, solo, and stereo-bus
 controls. Loopback recording uses this same bus and otherwise follows the ordinary
 Record and punch workflow; it has no separate bounce mode.
 
+Recording is deliberately destructive, like tape: captured audio is written to
+the project as it is recorded and is not part of mixer-state undo or discard.
+Close and quit confirmations therefore refer specifically to unsaved mixer
+changes; discarding those changes never rolls recorded audio back.
+
 ## Application configuration
 
 Recent projects, global Audio Settings, and the last positions of the main and
@@ -91,7 +96,17 @@ the versioned JSON file is located at
 `~/Library/Preferences/pkg.unusualaudio.tape-machine/config.json`. If a saved
 window is no longer on a connected display, it is moved onto the primary display.
 If saved audio hardware is unavailable, Tape Machine uses a compatible session
-fallback without overwriting the saved configuration.
+fallback without overwriting the saved configuration. Duplicate device names are
+matched with stored hardware characteristics when possible; ambiguous matches use
+the system default for the session and ask the user to confirm Audio Settings.
+The footer shows **Routing incomplete** when there is no usable input/output path,
+and **Some routes unavailable** when the current hardware can run but one or more
+saved channel assignments are out of range. Both warnings open Audio Settings.
+
+If one configuration section is damaged, the app salvages the other sections,
+resets only the invalid data, and keeps a timestamped `config.invalid-*.json`
+backup beside the repaired file. Compatible data from an older configuration
+schema is migrated the same way without interrupting startup.
 
 ## Development
 

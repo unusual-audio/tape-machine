@@ -14,10 +14,13 @@ from tape_machine.audio import (
     UNASSIGNED_BUS_OUTPUTS,
     UNASSIGNED_TRACK_INPUTS,
     AudioConfigurationError,
+    AudioDevice,
     DeviceReference,
     AudioDeviceService,
     AudioSettings,
+    RoutingStatus,
     StereoBusInput,
+    evaluate_routing_status,
 )
 
 
@@ -221,6 +224,68 @@ def test_device_reference_resolves_exact_match_then_default(
     assert service.resolve_device(
         DeviceReference("Missing", "Core Audio"), "input"
     ).index == 0
+    assert "not available" in service.resolution_warnings[0]
+
+
+def test_duplicate_device_names_require_an_unambiguous_fingerprint(
+    backend: FakeSoundDevice,
+) -> None:
+    backend.devices.append(
+        {
+            "name": "USB Interface",
+            "index": 3,
+            "hostapi": 0,
+            "max_input_channels": 2,
+            "max_output_channels": 2,
+            "default_samplerate": 48_000.0,
+        }
+    )
+    service = AudioDeviceService(backend)
+    service.refresh_devices()
+
+    ambiguous = service.resolve_device(
+        DeviceReference("USB Interface", "Core Audio"), "input"
+    )
+    exact = service.resolve_device(
+        DeviceReference(
+            "USB Interface",
+            "Core Audio",
+            max_input_channels=4,
+            max_output_channels=4,
+            default_sample_rate=44_100,
+        ),
+        "input",
+    )
+
+    assert ambiguous is not None and ambiguous.index == 0
+    assert exact is not None and exact.index == 2
+    assert any("Several input devices" in warning for warning in service.resolution_warnings)
+
+
+def test_routing_status_distinguishes_unavailable_from_incomplete_routes() -> None:
+    input_device = AudioDevice(0, "Input", "Core Audio", 2, 0, 48_000)
+    output_device = AudioDevice(1, "Output", "Core Audio", 0, 2, 48_000)
+    complete = AudioSettings(
+        0, 1, 48_000, (0,) + (None,) * 7, (0, 1)
+    )
+    degraded = AudioSettings(
+        0, 1, 48_000, (0, 3) + (None,) * 6, (0, 4)
+    )
+    unavailable = AudioSettings(
+        0, 1, 48_000, (3,) + (None,) * 7, (4, None)
+    )
+    loopback = AudioSettings(
+        0,
+        1,
+        48_000,
+        (StereoBusInput.LEFT,) + (None,) * 7,
+        (0, 1),
+    )
+
+    assert evaluate_routing_status(complete, input_device, output_device) is RoutingStatus.COMPLETE
+    assert evaluate_routing_status(degraded, input_device, output_device) is RoutingStatus.DEGRADED
+    assert evaluate_routing_status(unavailable, input_device, output_device) is RoutingStatus.INCOMPLETE
+    assert evaluate_routing_status(loopback, input_device, output_device) is RoutingStatus.COMPLETE
 
 
 def test_supported_rates_are_intersection_and_use_probe_format(

@@ -16,8 +16,11 @@ from tape_machine.audio import (
     UNASSIGNED_BUS_OUTPUTS,
     UNASSIGNED_TRACK_INPUTS,
     AudioConfigurationError,
+    AudioDevice,
     AudioDeviceService,
     AudioSettings,
+    RoutingStatus,
+    evaluate_routing_status,
 )
 from tape_machine.config import (
     AppConfig,
@@ -33,6 +36,7 @@ from tape_machine.project import AudioProject, ProjectError, ProjectMetadata
 from tape_machine.settings import AudioSettingsDraft, AudioSettingsWindow
 from tape_machine.theme import (
     ACCENT_BLUE,
+    ACCENT_ORANGE,
     ACCENT_RED,
     SECONDARY_TEXT,
     force_dark_appearance,
@@ -40,6 +44,7 @@ from tape_machine.theme import (
 from tape_machine.transport import (
     TransportController,
     TransportError,
+    TransportLifecycle,
     TransportMode,
     format_transport_time,
 )
@@ -177,17 +182,20 @@ def _style_link(
         owner=cursor_owner,
         userInfo=None,
     )
+    previous_tracking_area = getattr(button, "_link_tracking_area", None)
+    if previous_tracking_area is not None:
+        native.removeTrackingArea(previous_tracking_area)
     native.addTrackingArea(tracking_area)
     button._link_cursor_owner = cursor_owner
     button._link_tracking_area = tracking_area
     button._impl.rehint()
 
 
-def _style_status_link(button: toga.Button) -> None:
+def _style_status_link(button: toga.Button, color: str = ACCENT_RED) -> None:
     """Style the routing warning as a red settings link."""
     _style_link(
         button,
-        color=ACCENT_RED,
+        color=color,
         tooltip="Open Audio Settings",
     )
 
@@ -312,31 +320,27 @@ class TapeMachine(toga.App):
         """Create and show the main application window."""
         force_dark_appearance(self._impl.native)
         self.config_store = AppConfigStore(self.paths.config / "config.json")
+        startup_notices: list[str] = []
         try:
-            self.app_config = self.config_store.load()
+            config_result = self.config_store.load_with_recovery()
+            self.app_config = config_result.config
+            if config_result.notice_required:
+                recovered = ", ".join(config_result.recovered_sections) or "none"
+                reset = ", ".join(config_result.reset_sections) or "none"
+                startup_notices.append(
+                    "The application configuration was repaired.\n\n"
+                    f"Recovered: {recovered}.\nReset: {reset}.\n\n"
+                    f"The original file was preserved at {config_result.backup_path}."
+                )
         except AppConfigError as exc:
             print(exc, file=sys.stderr)
             self.app_config = AppConfig()
+            startup_notices.append(str(exc))
 
         self.audio_service = AudioDeviceService()
         self.audio_engine = AudioEngine()
-        try:
-            self.audio_service.refresh_devices()
-            stored_audio = self.app_config.audio_settings
-            preferred_audio = (
-                stored_audio.resolve(self.audio_service)
-                if stored_audio is not None
-                else None
-            )
-            self.audio_service.current_settings = self.audio_service.suggest_settings(
-                preferred_audio
-            )
-            self.global_audio_settings = self.audio_service.current_settings
-            startup_error = None
-        except AudioConfigurationError as exc:
-            self.audio_service.current_settings = None
-            self.global_audio_settings = None
-            startup_error = str(exc)
+        self.audio_service.current_settings = None
+        self.global_audio_settings: AudioSettings | None = None
 
         self.project: AudioProject | None = None
         self.mixer_state: MixerState | None = None
@@ -345,6 +349,11 @@ class TapeMachine(toga.App):
         self.transport_task: asyncio.Task[None] | None = None
         self.transport_starting = False
         self.transport_stopping = False
+        self.project_saving = False
+        self.audio_transitioning = True
+        self.audio_transition_lock = asyncio.Lock()
+        self.audio_initialization_task: asyncio.Task[None] | None = None
+        self.audio_health_reported = False
         self.momentary_shuttle_mode: TransportMode | None = None
         self.momentary_shuttle_release: asyncio.Event | None = None
         self.momentary_shuttle_task: asyncio.Task[None] | None = None
@@ -371,6 +380,7 @@ class TapeMachine(toga.App):
             align_items=CENTER,
         )
         self._routing_status_link_visible = False
+        self._routing_status = RoutingStatus.COMPLETE
         self.status_line_suffix_label = toga.Label("", font_size=11)
         self.status_line_content = toga.Box(
             children=[
@@ -448,8 +458,69 @@ class TapeMachine(toga.App):
         )
         self._rebuild_recent_files_menu()
         self._update_command_state()
-        self._update_audio_summary(startup_error)
+        self._update_audio_summary()
+        self.status_line_suffix_label.text = "  •  Initializing audio…"
         self.main_window.show()
+        try:
+            self.audio_initialization_task = (
+                asyncio.get_running_loop().create_task(
+                    self._initialize_startup_audio(startup_notices)
+                )
+            )
+        except RuntimeError:
+            # Toga normally provides a running loop during startup. Retain a
+            # synchronous fallback for nonstandard embedders.
+            try:
+                settings, warnings = self._discover_startup_audio()
+                self.audio_service.current_settings = settings
+                self.global_audio_settings = settings
+                startup_notices.extend(warnings)
+            except AudioConfigurationError as exc:
+                startup_notices.append(str(exc))
+            self.audio_transitioning = False
+            self._update_command_state()
+            self._update_audio_summary()
+            if startup_notices:
+                print("\n".join(startup_notices), file=sys.stderr)
+
+    def _discover_startup_audio(
+        self,
+    ) -> tuple[AudioSettings | None, tuple[str, ...]]:
+        """Resolve the saved hardware configuration on a worker thread."""
+        self.audio_service.refresh_devices()
+        stored_audio = self.app_config.audio_settings
+        preferred_audio = (
+            stored_audio.resolve(self.audio_service)
+            if stored_audio is not None
+            else None
+        )
+        settings = self.audio_service.suggest_settings(preferred_audio)
+        return settings, tuple(self.audio_service.resolution_warnings)
+
+    async def _initialize_startup_audio(self, startup_notices: list[str]) -> None:
+        try:
+            settings, warnings = await asyncio.to_thread(
+                self._discover_startup_audio
+            )
+            self.audio_service.current_settings = settings
+            self.global_audio_settings = settings
+            startup_notices.extend(warnings)
+        except AudioConfigurationError as exc:
+            self.audio_service.current_settings = None
+            self.global_audio_settings = None
+            startup_notices.append(str(exc))
+        finally:
+            self.audio_transitioning = False
+            self.audio_initialization_task = None
+            self._update_command_state()
+            self._update_audio_summary()
+        if startup_notices:
+            await self._show_startup_notices(startup_notices)
+
+    async def _show_startup_notices(self, notices: list[str]) -> None:
+        await self.main_window.dialog(
+            toga.InfoDialog("Configuration Notice", "\n\n".join(notices))
+        )
 
     def _build_initial_screen(self) -> toga.Box:
         self.initial_logo_view = toga.ImageView(
@@ -769,25 +840,32 @@ class TapeMachine(toga.App):
             self.momentary_shuttle_task is not None
             or self.transport
             and (
-                self.transport.running
+                getattr(self.transport, "busy", self.transport.running)
                 or self.transport_starting
                 or self.transport_stopping
             )
         )
-        self.new_project_command.enabled = not project_is_open
-        self.open_project_command.enabled = not project_is_open
-        self.save_project_command.enabled = project_is_open and not transport_busy
-        self.close_project_command.enabled = project_is_open and not transport_busy
-        self.settings_command.enabled = not transport_busy
+        app_busy = (
+            transport_busy
+            or getattr(self, "project_saving", False)
+            or getattr(self, "audio_transitioning", False)
+        )
+        self.new_project_command.enabled = not project_is_open and not app_busy
+        self.open_project_command.enabled = not project_is_open and not app_busy
+        self.save_project_command.enabled = project_is_open and not app_busy
+        self.close_project_command.enabled = project_is_open and not app_busy
+        self.settings_command.enabled = not app_busy
         for command in getattr(self, "recent_file_commands", ()):
-            command.enabled = not project_is_open
+            command.enabled = not project_is_open and not app_busy
 
-    def preferences(
+    async def preferences(
         self, widget: toga.Widget | toga.Command | None = None, **kwargs: object
     ) -> None:
         """Open the global Audio Settings, using a project's fixed rate."""
+        if getattr(self, "audio_transitioning", False):
+            return
         if self.project is None:
-            self.settings_window.open()
+            await self.settings_window.open()
             return
 
         current = self.audio_service.current_settings
@@ -804,15 +882,15 @@ class TapeMachine(toga.App):
             ),
             buffer_size=(fallback.buffer_size if fallback else 0),
         )
-        self.settings_window.open(
+        await self.settings_window.open(
             draft,
             locked_sample_rate=self.project.sample_rate,
         )
 
-    def _open_routing_settings(
+    async def _open_routing_settings(
         self, widget: toga.Widget | None = None, **kwargs: object
     ) -> None:
-        self.preferences()
+        await self.preferences()
 
     def _set_routing_status_link_visible(self, visible: bool) -> None:
         if visible == self._routing_status_link_visible:
@@ -822,6 +900,27 @@ class TapeMachine(toga.App):
             self.status_line_content.insert(1, self.routing_status_link_group)
         else:
             self.status_line_content.remove(self.routing_status_link_group)
+
+    def _set_routing_status(self, status: RoutingStatus) -> None:
+        """Show a linked routing warning with severity-specific wording."""
+        if status is self._routing_status:
+            self._set_routing_status_link_visible(
+                status is not RoutingStatus.COMPLETE
+            )
+            return
+        self._routing_status = status
+        if status is RoutingStatus.COMPLETE:
+            self._set_routing_status_link_visible(False)
+            return
+        text, color = (
+            ("Routing incomplete", ACCENT_RED)
+            if status is RoutingStatus.INCOMPLETE
+            else ("Some routes unavailable", ACCENT_ORANGE)
+        )
+        self.routing_status_link.text = text
+        self.routing_status_link.style.color = color
+        _style_status_link(self.routing_status_link, color)
+        self._set_routing_status_link_visible(True)
 
     def _updated_config_for_audio_settings(
         self, settings: AudioSettings
@@ -835,21 +934,40 @@ class TapeMachine(toga.App):
         )
         return self.app_config.with_audio_settings(stored)
 
-    def _audio_settings_applied(self, settings: AudioSettings) -> None:
-        if self.project is not None:
-            self._project_audio_settings_applied(settings)
-            return
+    async def _audio_settings_applied(self, settings: AudioSettings) -> None:
+        async with self.audio_transition_lock:
+            self.audio_transitioning = True
+            self._update_command_state()
+            self._sync_transport_controls()
+            try:
+                if self.project is not None:
+                    await self._project_audio_settings_applied(settings)
+                    return
 
+                await asyncio.to_thread(self._validate_audio_settings, settings)
+                updated = self._updated_config_for_audio_settings(settings)
+                await asyncio.to_thread(self.config_store.save, updated)
+                self.app_config = updated
+                self.global_audio_settings = settings
+                self.audio_service.current_settings = settings
+                self._update_audio_summary()
+            finally:
+                self.audio_transitioning = False
+                self._update_command_state()
+                self._sync_transport_controls()
+
+    def _validate_audio_settings(
+        self, settings: AudioSettings
+    ) -> tuple[AudioDevice, AudioDevice]:
         self.audio_service.refresh_devices()
         self.audio_service.validate(settings)
-        updated = self._updated_config_for_audio_settings(settings)
-        self.config_store.save(updated)
-        self.app_config = updated
-        self.global_audio_settings = settings
-        self.audio_service.current_settings = settings
-        self._update_audio_summary()
+        input_device = self.audio_service.device(settings.input_device_id, "input")
+        output_device = self.audio_service.device(settings.output_device_id, "output")
+        if input_device is None or output_device is None:
+            raise AudioConfigurationError("The selected audio devices disappeared.")
+        return input_device, output_device
 
-    def _project_audio_settings_applied(self, settings: AudioSettings) -> None:
+    async def _project_audio_settings_applied(self, settings: AudioSettings) -> None:
         if self.project is None:
             raise ProjectError("No project is open.")
         if self.mixer_state is None:
@@ -862,22 +980,13 @@ class TapeMachine(toga.App):
         reuse_stream = old_engine_running and settings == old_settings
         if not reuse_stream:
             if old_engine_running:
-                self.audio_engine.stop()
+                await asyncio.to_thread(self.audio_engine.stop)
             try:
-                self.audio_service.refresh_devices()
-                self.audio_service.validate(settings)
-                input_device = self.audio_service.device(
-                    settings.input_device_id, "input"
+                input_device, output_device = await asyncio.to_thread(
+                    self._validate_audio_settings, settings
                 )
-                output_device = self.audio_service.device(
-                    settings.output_device_id, "output"
-                )
-                if input_device is None or output_device is None:
-                    raise AudioConfigurationError(
-                        "The selected audio devices disappeared."
-                    )
             except AudioConfigurationError:
-                restored = self._restore_audio_engine(
+                restored = await self._restore_audio_engine(
                     old_settings, old_engine_running
                 )
                 if old_engine_running and not restored:
@@ -910,14 +1019,15 @@ class TapeMachine(toga.App):
 
         if not reuse_stream:
             try:
-                self.audio_engine.start(
+                await asyncio.to_thread(
+                    self.audio_engine.start,
                     settings,
                     self.mixer_state,
                     input_device,
                     output_device,
                 )
             except AudioEngineError as exc:
-                restored = self._restore_audio_engine(
+                restored = await self._restore_audio_engine(
                     old_settings, old_engine_running
                 )
                 if not restored:
@@ -926,11 +1036,11 @@ class TapeMachine(toga.App):
                 raise
 
         try:
-            self.config_store.save(updated_config)
+            await asyncio.to_thread(self.config_store.save, updated_config)
         except Exception:
             if not reuse_stream:
-                self.audio_engine.stop()
-                restored = self._restore_audio_engine(
+                await asyncio.to_thread(self.audio_engine.stop)
+                restored = await self._restore_audio_engine(
                     old_settings, old_engine_running
                 )
                 if old_engine_running and not restored:
@@ -944,6 +1054,7 @@ class TapeMachine(toga.App):
         self.global_audio_settings = global_settings
         self.audio_service.current_settings = settings
         self.project_audio_error = None
+        self.audio_health_reported = False
         if self.mixer_view is not None:
             self.mixer_view.update_track_routes(settings.track_inputs)
             self.mixer_view.set_monitoring_available(True)
@@ -960,6 +1071,8 @@ class TapeMachine(toga.App):
     async def new_project(
         self, widget: toga.Widget | None = None, **kwargs: object
     ) -> None:
+        if self.project_saving or self.audio_transitioning:
+            return
         settings = self.audio_service.current_settings
         if settings is None:
             await self.main_window.dialog(
@@ -969,7 +1082,7 @@ class TapeMachine(toga.App):
                     "creating a project.",
                 )
             )
-            self.preferences()
+            await self.preferences()
             return
 
         path = await self.main_window.dialog(
@@ -986,17 +1099,28 @@ class TapeMachine(toga.App):
             path = Path(f"{path}.wav")
 
         try:
-            project = AudioProject.create(
-                path, settings.sample_rate, ProjectMetadata()
+            self.project_saving = True
+            self._update_command_state()
+            project = await asyncio.to_thread(
+                AudioProject.create,
+                path,
+                settings.sample_rate,
+                ProjectMetadata(),
             )
         except ProjectError as exc:
             await self._show_project_error(str(exc))
+            self._update_audio_summary(self.project_audio_error)
             return
-        self._enter_project(project)
+        finally:
+            self.project_saving = False
+            self._update_command_state()
+        await self._enter_project(project)
 
     async def open_project(
         self, widget: toga.Widget | None = None, **kwargs: object
     ) -> None:
+        if self.project_saving or self.audio_transitioning:
+            return
         path = await self.main_window.dialog(
             toga.OpenFileDialog(
                 "Open Project",
@@ -1012,25 +1136,40 @@ class TapeMachine(toga.App):
     async def _open_project_path(self, path: Path) -> bool:
         """Open one known path and share handling with the recent-files menu."""
 
+        if self.project_saving or self.audio_transitioning:
+            return False
+        self.project_saving = True
+        self._update_command_state()
         try:
-            project = AudioProject.open(path)
+            project = await asyncio.to_thread(AudioProject.open, path)
         except ProjectError as exc:
             if not path.exists():
                 self._forget_recent_file(path)
             await self._show_project_error(str(exc))
             return False
-        self._enter_project(project)
+        finally:
+            self.project_saving = False
+            self._update_command_state()
+        await self._enter_project(project)
         return True
 
-    def _enter_project(self, project: AudioProject) -> None:
+    async def _enter_project(self, project: AudioProject) -> None:
         self.settings_window.window.hide()
         self._remember_recent_file(project.path)
         self.project = project
-        self.project_audio_error = self._resolve_project_audio()
+        self.project_audio_error = await asyncio.to_thread(
+            self._resolve_project_audio
+        )
         self._update_command_state()
         self.main_window.content = self._build_project_screen()
         self.main_window.title = f"{self.formal_name} — {project.path.name}"
-        self._start_project_audio()
+        self.audio_transitioning = True
+        self._update_command_state()
+        self._sync_transport_controls()
+        try:
+            await self._start_project_audio()
+        finally:
+            self.audio_transitioning = False
         self._update_command_state()
         self._sync_transport_controls()
         self.transport_task = asyncio.create_task(self._transport_clock())
@@ -1041,7 +1180,11 @@ class TapeMachine(toga.App):
     ) -> None:
         if self.transport is None or self.project is None:
             return
-        if self.momentary_shuttle_task is not None:
+        if (
+            self.momentary_shuttle_task is not None
+            or getattr(self, "project_saving", False)
+            or getattr(self, "audio_transitioning", False)
+        ):
             return
         if not self.project.writable and not self.transport.record_armed:
             self._schedule_transport_dialog(
@@ -1061,6 +1204,10 @@ class TapeMachine(toga.App):
             or not self.audio_engine.running
             or self.transport.running
             or self.transport_starting
+            or self.transport_stopping
+            or self.transport.busy
+            or getattr(self, "project_saving", False)
+            or getattr(self, "audio_transitioning", False)
         ):
             return
         armed_tracks = tuple(
@@ -1094,6 +1241,8 @@ class TapeMachine(toga.App):
             or self.transport_starting
             or self.transport_stopping
             or self.momentary_shuttle_task is not None
+            or getattr(self, "project_saving", False)
+            or getattr(self, "audio_transitioning", False)
         ):
             return
         if transport.mode is TransportMode.PLAYING:
@@ -1167,6 +1316,8 @@ class TapeMachine(toga.App):
             or not self.audio_engine.running
             or self.transport_starting
             or self.transport_stopping
+            or getattr(self, "project_saving", False)
+            or getattr(self, "audio_transitioning", False)
         ):
             return
 
@@ -1244,10 +1395,23 @@ class TapeMachine(toga.App):
         transport = self.transport
         try:
             while self.transport is transport and transport is not None:
+                was_busy = transport.busy
+                transport.poll_lifecycle()
+                if was_busy != transport.busy:
+                    self._update_command_state()
                 self._sync_transport_controls()
                 self._sync_meters()
                 if transport.running and transport.end_requested:
                     await self._stop_transport()
+                health = self.audio_engine.health_snapshot
+                if health.fault is not None and not self.audio_health_reported:
+                    self.audio_health_reported = True
+                    if transport.running:
+                        await self._stop_transport()
+                    await asyncio.to_thread(self.audio_engine.stop)
+                    self._set_audio_engine_failure(
+                        health.message or "The audio stream stopped unexpectedly."
+                    )
                 await asyncio.sleep(1 / 30)
         except asyncio.CancelledError:
             pass
@@ -1261,11 +1425,22 @@ class TapeMachine(toga.App):
         )
 
     def _sync_transport_controls(self) -> None:
-        if self.transport is None or not hasattr(
+        if getattr(self, "transport", None) is None or not hasattr(
             self, "transport_record_button"
         ):
             return
-        busy = self.transport_starting or self.transport_stopping
+        busy = (
+            self.transport_starting
+            or self.transport_stopping
+            or getattr(self, "project_saving", False)
+            or getattr(self, "audio_transitioning", False)
+            or getattr(self.transport, "lifecycle", TransportLifecycle.RUNNING)
+            in {
+                TransportLifecycle.STARTING,
+                TransportLifecycle.STOPPING,
+                TransportLifecycle.FAULTED,
+            }
+        )
         rolling = self.transport.running
         mode = self.transport.mode
         shuttling = mode.shuttling
@@ -1348,7 +1523,7 @@ class TapeMachine(toga.App):
             self.main_window.dialog(toga.ErrorDialog("Transport Error", message))
         )
 
-    def _start_project_audio(self) -> None:
+    async def _start_project_audio(self) -> None:
         settings = self.audio_service.current_settings
         if settings is None or self.project_audio_error is not None:
             self._set_audio_engine_failure(
@@ -1366,7 +1541,8 @@ class TapeMachine(toga.App):
             return
         assert self.mixer_state is not None
         try:
-            self.audio_engine.start(
+            await asyncio.to_thread(
+                self.audio_engine.start,
                 settings,
                 self.mixer_state,
                 input_device,
@@ -1376,11 +1552,12 @@ class TapeMachine(toga.App):
             self._set_audio_engine_failure(str(exc))
             return
         self.audio_engine_error = None
+        self.audio_health_reported = False
         if self.mixer_view is not None:
             self.mixer_view.set_monitoring_available(True)
         self._sync_transport_controls()
 
-    def _restore_audio_engine(
+    async def _restore_audio_engine(
         self,
         settings: AudioSettings | None,
         was_running: bool,
@@ -1394,7 +1571,8 @@ class TapeMachine(toga.App):
         if input_device is None or output_device is None:
             return False
         try:
-            self.audio_engine.start(
+            await asyncio.to_thread(
+                self.audio_engine.start,
                 settings,
                 self.mixer_state,
                 input_device,
@@ -1403,6 +1581,7 @@ class TapeMachine(toga.App):
         except AudioEngineError:
             return False
         self.audio_engine_error = None
+        self.audio_health_reported = False
         if self.mixer_view is not None:
             self.mixer_view.set_monitoring_available(True)
         self._update_audio_summary()
@@ -1433,7 +1612,6 @@ class TapeMachine(toga.App):
     def _set_audio_engine_failure(
         self, message: str, *, show_dialog: bool = True
     ) -> None:
-        self.audio_engine.stop()
         self.audio_engine_error = message
         if self.mixer_view is not None:
             self.mixer_view.set_monitoring_available(False)
@@ -1478,13 +1656,22 @@ class TapeMachine(toga.App):
     async def save_project(
         self, widget: toga.Widget | None = None, **kwargs: object
     ) -> None:
-        if self.project is None:
+        if self.project is None or self.project_saving:
             return
+        self.project_saving = True
+        self._update_command_state()
+        self._sync_transport_controls()
+        self.status_line_suffix_label.text = "  •  Saving…"
         try:
-            self.project.save()
+            await asyncio.to_thread(self.project.save)
         except ProjectError as exc:
             await self._show_project_error(str(exc))
+            self._update_audio_summary(self.project_audio_error)
             return
+        finally:
+            self.project_saving = False
+            self._update_command_state()
+            self._sync_transport_controls()
         self._update_audio_summary(self.project_audio_error)
 
     async def close_project(
@@ -1493,7 +1680,7 @@ class TapeMachine(toga.App):
         if self.project is None:
             return
         if self.transport is not None and (
-            self.transport.running
+            self.transport.busy
             or self.transport_starting
             or self.transport_stopping
             or self.momentary_shuttle_task is not None
@@ -1502,21 +1689,22 @@ class TapeMachine(toga.App):
         if self.project.dirty:
             discard = await self.main_window.dialog(
                 toga.ConfirmDialog(
-                    "Discard Unsaved Changes?",
-                    "Close without saving changes to this project?",
+                    "Discard Unsaved Mixer Changes?",
+                    "Close without saving mixer changes? Recorded audio has "
+                    "already been written and will not be undone.",
                 )
             )
             if not discard:
                 return
         try:
-            self.project.close()
+            await asyncio.to_thread(self.project.close)
         except Exception as exc:
             await self._show_project_error(f"Unable to close project: {exc}")
             return
-        self._leave_project()
+        await self._leave_project()
 
-    def _leave_project(self) -> None:
-        self.audio_engine.stop()
+    async def _leave_project(self) -> None:
+        await asyncio.to_thread(self.audio_engine.stop)
         self.audio_engine.set_transport(None)
         if self.momentary_shuttle_task is not None:
             self.momentary_shuttle_task.cancel()
@@ -1539,11 +1727,11 @@ class TapeMachine(toga.App):
         self.audio_engine_error = None
         self.settings_window.window.hide()
         try:
-            self.audio_service.refresh_devices()
-            self.audio_service.current_settings = self.audio_service.suggest_settings(
-                self.global_audio_settings
+            refreshed_settings = await asyncio.to_thread(
+                self._refresh_global_audio_settings
             )
-            self.global_audio_settings = self.audio_service.current_settings
+            self.audio_service.current_settings = refreshed_settings
+            self.global_audio_settings = refreshed_settings
         except AudioConfigurationError:
             self.audio_service.current_settings = None
             self.global_audio_settings = None
@@ -1551,6 +1739,10 @@ class TapeMachine(toga.App):
         self.main_window.content = self._build_initial_screen()
         self.main_window.title = self.formal_name
         self._update_audio_summary()
+
+    def _refresh_global_audio_settings(self) -> AudioSettings | None:
+        self.audio_service.refresh_devices()
+        return self.audio_service.suggest_settings(self.global_audio_settings)
 
     def _save_window_positions(self) -> None:
         try:
@@ -1567,29 +1759,47 @@ class TapeMachine(toga.App):
 
     async def on_exit(self) -> bool:
         if self.project is None:
+            if self.audio_transitioning:
+                return False
             self._save_window_positions()
             return True
-        if self.transport_starting or self.transport_stopping:
+        if (
+            self.transport_starting
+            or self.transport_stopping
+            or self.project_saving
+            or self.audio_transitioning
+        ):
             return False
         if self.momentary_shuttle_task is not None:
             await self._end_momentary_shuttle()
         if self.transport is not None and self.transport.running:
             await self._stop_transport()
+        if self.transport is not None and self.transport.busy:
+            await self.main_window.dialog(
+                toga.ErrorDialog(
+                    "Recording Still Finishing",
+                    "Tape Machine is still waiting for an audio worker to "
+                    "release the project file. Try quitting again after the "
+                    "transport error has cleared.",
+                )
+            )
+            return False
         if self.project.dirty:
             discard = await self.main_window.dialog(
                 toga.ConfirmDialog(
-                    "Discard Unsaved Changes?",
-                    "Exit without saving changes to this project?",
+                    "Discard Unsaved Mixer Changes?",
+                    "Exit without saving mixer changes? Recorded audio has "
+                    "already been written and will not be undone.",
                 )
             )
             if not discard:
                 return False
         try:
-            self.project.close()
+            await asyncio.to_thread(self.project.close)
         except Exception as exc:
             await self._show_project_error(f"Unable to close project: {exc}")
             return False
-        self.audio_engine.stop()
+        await asyncio.to_thread(self.audio_engine.stop)
         self._save_window_positions()
         return True
 
@@ -1633,13 +1843,18 @@ class TapeMachine(toga.App):
             else "Sample rate unavailable"
         )
 
-        routing_complete = any(
-            channel is not None for channel in routing
-        ) and any(channel is not None for channel in bus_outputs)
         self.status_line_label.text = (
             f"{device_summary}  •  {sample_rate_summary}"
         )
-        self._set_routing_status_link_visible(not routing_complete)
+        routing_status = evaluate_routing_status(
+            settings, input_device, output_device
+        )
+        if hasattr(self, "_set_routing_status"):
+            self._set_routing_status(routing_status)
+        else:
+            self._set_routing_status_link_visible(
+                routing_status is not RoutingStatus.COMPLETE
+            )
         self.status_line_suffix_label.text = (
             "  •  Audio unavailable"
             if self.project is not None and self.audio_engine_error is not None

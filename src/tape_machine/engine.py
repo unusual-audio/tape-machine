@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from math import log10, sqrt
 from time import sleep
 from typing import Any, Callable, Protocol
@@ -67,11 +68,27 @@ class TransportAudioSource(Protocol):
     ) -> None: ...
 
 
+class EngineFault(Enum):
+    """Asynchronous stream failures observable by the UI coordinator."""
+
+    CALLBACK = "callback"
+    STREAM_FINISHED = "stream_finished"
+
+
+@dataclass(frozen=True, slots=True)
+class EngineHealthSnapshot:
+    """Current non-real-time health state for the active stream."""
+
+    fault: EngineFault | None = None
+    message: str | None = None
+
+
 METER_FLOOR_DB = -60.0
 METER_CEILING_DB = 0.0
 METER_FALL_DB_PER_SECOND = 20.0
 _METER_VALUE_COUNT = PROJECT_TRACK_COUNT + STEREO_BUS_CHANNEL_COUNT
 _NO_RECORDING_TRACKS = (False,) * PROJECT_TRACK_COUNT
+_CALLBACK_SCRATCH_FRAMES = 8192
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +280,9 @@ class AudioEngine:
         )
         self._meter_generation = 0
         self._meter_ui_snapshot = _silent_meter_snapshot()
+        self._active_stream_token: object | None = None
+        self._stream_finished_unexpectedly = False
+        self._callback_fault: str | None = None
 
     @property
     def running(self) -> bool:
@@ -290,6 +310,17 @@ class AudioEngine:
             return self._meter_ui_snapshot
         self._meter_ui_snapshot = snapshot
         return snapshot
+
+    @property
+    def health_snapshot(self) -> EngineHealthSnapshot:
+        if self._callback_fault is not None:
+            return EngineHealthSnapshot(EngineFault.CALLBACK, self._callback_fault)
+        if self._stream_finished_unexpectedly:
+            return EngineHealthSnapshot(
+                EngineFault.STREAM_FINISHED,
+                "The audio device stopped the stream unexpectedly.",
+            )
+        return EngineHealthSnapshot()
 
     def start(
         self,
@@ -319,6 +350,7 @@ class AudioEngine:
             if retry_delay:
                 self._sleep(retry_delay)
             try:
+                stream_token = object()
                 stream = self.backend.RawStream(
                     samplerate=settings.sample_rate,
                     blocksize=settings.buffer_size,
@@ -330,7 +362,11 @@ class AudioEngine:
                     dtype="float32",
                     latency="low",
                     callback=self._callback,
+                    finished_callback=lambda: self._stream_finished(stream_token),
                 )
+                # Publish ownership immediately so every later setup failure
+                # closes the partially constructed backend stream.
+                self._stream = stream
                 self._settings = settings
                 self._input_channels = input_channels
                 self._output_channels = output_channels
@@ -340,7 +376,10 @@ class AudioEngine:
                     bus_gain,
                 )
                 self._bus_output_matrix = bus_output_matrix
-                self._stream = stream
+                self._allocate_audio_scratch(_CALLBACK_SCRATCH_FRAMES)
+                self._active_stream_token = stream_token
+                self._stream_finished_unexpectedly = False
+                self._callback_fault = None
                 stream.start()
                 return
             except Exception as exc:
@@ -359,6 +398,9 @@ class AudioEngine:
         failed_stream = self._stream
         self._stream = None
         self._settings = None
+        self._active_stream_token = None
+        self._stream_finished_unexpectedly = False
+        self._callback_fault = None
         self._mix_snapshot = (
             np.zeros((1, 2), dtype=np.float32),
             np.zeros((8, 2), dtype=np.float32),
@@ -405,7 +447,10 @@ class AudioEngine:
         """Stop and close the current stream, tolerating device removal."""
         stream = self._stream
         self._stream = None
+        self._active_stream_token = None
         self._settings = None
+        self._stream_finished_unexpectedly = False
+        self._callback_fault = None
         self._mix_snapshot = (
             np.zeros((1, 2), dtype=np.float32),
             np.zeros((8, 2), dtype=np.float32),
@@ -427,6 +472,11 @@ class AudioEngine:
             pass
         self._reset_meter_levels()
 
+    def _stream_finished(self, token: object) -> None:
+        """Publish an unexpected backend termination without touching the UI."""
+        if token is self._active_stream_token:
+            self._stream_finished_unexpectedly = True
+
     def _callback(
         self,
         input_buffer: object,
@@ -435,13 +485,40 @@ class AudioEngine:
         time: Any,
         status: Any,
     ) -> None:
-        """Render one monitoring block without locks or intermediate arrays."""
+        """Render one monitoring block using bounded, preallocated storage."""
         indata = np.frombuffer(input_buffer, dtype=np.float32).reshape(
             frames, self._input_channels
         )
         outdata = np.frombuffer(output_buffer, dtype=np.float32).reshape(
             frames, self._output_channels
         )
+        if self._settings is None:
+            outdata.fill(0)
+            return
+        try:
+            offset = 0
+            while offset < frames:
+                amount = min(_CALLBACK_SCRATCH_FRAMES, frames - offset)
+                self._render_callback_block(
+                    indata[offset : offset + amount],
+                    outdata[offset : offset + amount],
+                    amount,
+                    status,
+                )
+                offset += amount
+        except Exception as exc:
+            outdata.fill(0)
+            if self._callback_fault is None:
+                self._callback_fault = str(exc)
+
+    def _render_callback_block(
+        self,
+        indata: np.ndarray,
+        outdata: np.ndarray,
+        frames: int,
+        status: object,
+    ) -> None:
+        """Render one scratch-sized portion of a host callback."""
         monitor_bus_matrix, playback_bus_matrix, bus_gain = self._mix_snapshot
         (
             pre_bus,
@@ -459,10 +536,25 @@ class AudioEngine:
         transport = self._transport
         playback: np.ndarray | None = None
         capture_context: CaptureAudioContext | None = None
+        render_state: object | None = None
         if transport is not None:
-            playback, capture_context = transport.prepare_audio(
-                frames, status, track_playback
-            )
+            render_audio = getattr(transport, "render_audio", None)
+            if callable(render_audio):
+                render_state = render_audio(frames, status, track_playback)
+                playback = (
+                    track_playback
+                    if getattr(render_state, "playback_active", False)
+                    else None
+                )
+                capture_context = (
+                    render_state
+                    if getattr(render_state, "capture_active", False)
+                    else None
+                )
+            else:
+                playback, capture_context = transport.prepare_audio(
+                    frames, status, track_playback
+                )
             if (
                 playback is not None
                 and playback.shape[1] == playback_bus_matrix.shape[0]
@@ -488,7 +580,11 @@ class AudioEngine:
         ):
             np.matmul(stereo_bus, bus_output_matrix, out=outdata)
         if transport is not None and capture_context is not None:
-            transport.submit_capture(capture_context, indata, stereo_bus)
+            enqueue_capture = getattr(transport, "enqueue_capture", None)
+            if render_state is not None and callable(enqueue_capture):
+                enqueue_capture(render_state, indata, stereo_bus)
+            else:
+                transport.submit_capture(capture_context, indata, stereo_bus)
         np.clip(outdata, -1.0, 1.0, out=outdata)
 
     def _audio_scratch(
@@ -496,19 +592,9 @@ class AudioEngine:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return reusable callback buffers sized for the current block."""
         if len(self._stereo_bus_scratch) < frames:
-            self._pre_bus_scratch = np.zeros(
-                (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+            raise AudioEngineError(
+                "The audio callback exceeded its preallocated scratch capacity."
             )
-            self._stereo_bus_scratch = np.zeros(
-                (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
-            )
-            self._playback_bus_scratch = np.zeros(
-                (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
-            )
-            self._track_playback_scratch = np.zeros(
-                (frames, PROJECT_TRACK_COUNT), dtype=np.float32
-            )
-            self._meter_abs_scratch = np.zeros(frames, dtype=np.float32)
         return (
             self._pre_bus_scratch[:frames],
             self._stereo_bus_scratch[:frames],
@@ -617,6 +703,22 @@ class AudioEngine:
             (0, PROJECT_TRACK_COUNT), dtype=np.float32
         )
         self._meter_abs_scratch = np.zeros(0, dtype=np.float32)
+
+    def _allocate_audio_scratch(self, frames: int) -> None:
+        """Allocate callback-owned arrays before the stream can invoke them."""
+        self._pre_bus_scratch = np.zeros(
+            (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
+        self._stereo_bus_scratch = np.zeros(
+            (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
+        self._playback_bus_scratch = np.zeros(
+            (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
+        self._track_playback_scratch = np.zeros(
+            (frames, PROJECT_TRACK_COUNT), dtype=np.float32
+        )
+        self._meter_abs_scratch = np.zeros(frames, dtype=np.float32)
 
 
 def _is_transient_core_audio_error(exc: Exception) -> bool:

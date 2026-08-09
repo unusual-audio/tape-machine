@@ -23,6 +23,14 @@ class StereoBusInput(StrEnum):
     RIGHT = "stereo_bus_r"
 
 
+class RoutingStatus(StrEnum):
+    """Availability of the saved routing on the selected hardware."""
+
+    COMPLETE = "complete"
+    DEGRADED = "degraded"
+    INCOMPLETE = "incomplete"
+
+
 type TrackInputRoute = int | StereoBusInput | None
 
 UNASSIGNED_TRACK_INPUTS: tuple[TrackInputRoute, ...] = (
@@ -82,7 +90,17 @@ class AudioDevice:
     @property
     def reference(self) -> DeviceReference:
         """Return the stable descriptor stored in application configuration."""
-        return DeviceReference(name=self.name, host_api=self.host_api)
+        return DeviceReference(
+            name=self.name,
+            host_api=self.host_api,
+            max_input_channels=self.max_input_channels,
+            max_output_channels=self.max_output_channels,
+            default_sample_rate=self.default_sample_rate,
+            channel_name_signature=tuple(
+                name or ""
+                for name in self.input_channel_names + self.output_channel_names
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +109,18 @@ class DeviceReference:
 
     name: str
     host_api: str
+    max_input_channels: int | None = None
+    max_output_channels: int | None = None
+    default_sample_rate: int | None = None
+    channel_name_signature: tuple[str, ...] = ()
+
+    @property
+    def has_fingerprint(self) -> bool:
+        return (
+            self.max_input_channels is not None
+            and self.max_output_channels is not None
+            and self.default_sample_rate is not None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +161,7 @@ class AudioDeviceService:
         self.default_input_device_id: int | None = None
         self.default_output_device_id: int | None = None
         self.current_settings: AudioSettings | None = None
+        self.resolution_warnings: list[str] = []
 
     def initialize(self) -> AudioSettings | None:
         """Discover hardware and select a usable session default, if possible."""
@@ -142,6 +173,7 @@ class AudioDeviceService:
         self,
     ) -> tuple[tuple[AudioDevice, ...], tuple[AudioDevice, ...]]:
         """Refresh the input and output device inventories."""
+        self.resolution_warnings = []
         try:
             raw_devices = self._backend.query_devices()
         except Exception as exc:
@@ -423,17 +455,33 @@ class AudioDeviceService:
         """Resolve a stored descriptor, falling back to the system default."""
         inventory = self.input_devices if direction == "input" else self.output_devices
         if reference is not None:
-            match = next(
-                (
-                    device
-                    for device in inventory
-                    if device.name == reference.name
-                    and device.host_api == reference.host_api
-                ),
-                None,
+            matches = tuple(
+                device
+                for device in inventory
+                if device.name == reference.name
+                and device.host_api == reference.host_api
             )
-            if match is not None:
-                return match
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1 and reference.has_fingerprint:
+                fingerprint_matches = tuple(
+                    device
+                    for device in matches
+                    if _device_matches_reference(device, reference)
+                )
+                if len(fingerprint_matches) == 1:
+                    return fingerprint_matches[0]
+            if len(matches) > 1:
+                self._add_resolution_warning(
+                    f"Several {direction} devices match {reference.name!r}; "
+                    "the system default is being used until Audio Settings "
+                    "is confirmed."
+                )
+            elif not matches:
+                self._add_resolution_warning(
+                    f"The saved {direction} device {reference.name!r} is not "
+                    "available; the system default is being used for this session."
+                )
 
         default_id = (
             self.default_input_device_id
@@ -441,6 +489,10 @@ class AudioDeviceService:
             else self.default_output_device_id
         )
         return self.device(default_id, direction) if default_id is not None else None
+
+    def _add_resolution_warning(self, message: str) -> None:
+        if message not in self.resolution_warnings:
+            self.resolution_warnings.append(message)
 
     def compatibility_error(self, settings: AudioSettings) -> str | None:
         """Return a hardware compatibility message without activating settings."""
@@ -623,3 +675,51 @@ class AudioDeviceService:
                 f"Audio {direction} device {device_id} is no longer available."
             )
         return device
+
+
+def evaluate_routing_status(
+    settings: AudioSettings | None,
+    input_device: AudioDevice | None,
+    output_device: AudioDevice | None,
+) -> RoutingStatus:
+    """Classify assigned routes by their effective hardware availability."""
+    if settings is None or input_device is None or output_device is None:
+        return RoutingStatus.INCOMPLETE
+    usable_input = any(
+        isinstance(route, StereoBusInput)
+        or is_physical_input(route)
+        and route < input_device.max_input_channels
+        for route in settings.track_inputs
+    )
+    usable_output = any(
+        channel is not None and channel < output_device.max_output_channels
+        for channel in settings.bus_outputs
+    )
+    if not usable_input or not usable_output:
+        return RoutingStatus.INCOMPLETE
+    unavailable = any(
+        is_physical_input(route) and route >= input_device.max_input_channels
+        for route in settings.track_inputs
+    ) or any(
+        channel is not None and channel >= output_device.max_output_channels
+        for channel in settings.bus_outputs
+    )
+    return RoutingStatus.DEGRADED if unavailable else RoutingStatus.COMPLETE
+
+
+def _device_matches_reference(
+    device: AudioDevice, reference: DeviceReference
+) -> bool:
+    signature = tuple(
+        name or ""
+        for name in device.input_channel_names + device.output_channel_names
+    )
+    return (
+        device.max_input_channels == reference.max_input_channels
+        and device.max_output_channels == reference.max_output_channels
+        and device.default_sample_rate == reference.default_sample_rate
+        and (
+            not reference.channel_name_signature
+            or signature == reference.channel_name_signature
+        )
+    )

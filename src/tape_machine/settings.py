@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass
-from typing import Callable
+from inspect import isawaitable
+from typing import Awaitable, Callable
 
 import toga
 from toga.style.pack import CENTER, COLUMN, END, ROW
@@ -167,7 +169,7 @@ class AudioSettingsWindow:
     def __init__(
         self,
         service: AudioDeviceService,
-        on_applied: Callable[[AudioSettings], None],
+        on_applied: Callable[[AudioSettings], Awaitable[None] | None],
         *,
         position: tuple[int, int] | None = None,
     ) -> None:
@@ -206,9 +208,10 @@ class AudioSettingsWindow:
         self.save_button = toga.Button(
             "Save", on_press=self._save, enabled=False, margin_left=8
         )
+        self.cancel_button = toga.Button("Cancel", on_press=self._cancel)
         self.button_row = toga.Box(
             children=[
-                toga.Button("Cancel", on_press=self._cancel),
+                self.cancel_button,
                 self.save_button,
             ],
             direction=ROW,
@@ -258,12 +261,12 @@ class AudioSettingsWindow:
             margin_bottom=12,
         )
 
-    def open(
+    async def open(
         self,
         draft: AudioSettingsDraft | None = None,
         *,
         locked_sample_rate: int | None = None,
-        on_applied: Callable[[AudioSettings], None] | None = None,
+        on_applied: Callable[[AudioSettings], Awaitable[None] | None] | None = None,
     ) -> None:
         """Refresh and show the window, or leave an already-visible draft intact."""
         if self.window.visible:
@@ -273,18 +276,20 @@ class AudioSettingsWindow:
         )
         self.locked_sample_rate = locked_sample_rate
         self.on_applied = on_applied or self.default_on_applied
-        self._load_draft()
+        await self._load_draft()
         self.window.show()
 
     def _set_save_enabled(self, enabled: bool) -> None:
         self.save_button.enabled = enabled
 
-    def _load_draft(self) -> None:
+    async def _load_draft(self) -> None:
         self._updating = True
         self.status_label.text = ""
         self._set_save_enabled(False)
         try:
-            inputs, outputs = self.service.refresh_devices()
+            inputs, outputs = await asyncio.to_thread(
+                self.service.refresh_devices
+            )
             self.input_selection.items = [
                 DeviceChoice(device, "input") for device in inputs
             ]
@@ -300,7 +305,9 @@ class AudioSettingsWindow:
                 and loaded_draft.input_device_id is None
                 and loaded_draft.output_device_id is None
             ):
-                suggested = self.service.suggest_settings()
+                suggested = await asyncio.to_thread(
+                    self.service.suggest_settings
+                )
                 loaded_draft = AudioSettingsDraft.from_settings(suggested)
 
             self.buffer_size_selection.value = BufferSizeChoice(
@@ -328,7 +335,7 @@ class AudioSettingsWindow:
                     loaded_draft.track_inputs,
                     loaded_draft.bus_outputs,
                 )
-                self._update_sample_rates(
+                await self._update_sample_rates(
                     self.locked_sample_rate or loaded_draft.sample_rate
                 )
             else:
@@ -370,7 +377,9 @@ class AudioSettingsWindow:
                 selection.value = choice
                 return
 
-    def _on_device_changed(self, widget: toga.Widget, **kwargs: object) -> None:
+    async def _on_device_changed(
+        self, widget: toga.Widget, **kwargs: object
+    ) -> None:
         if self._updating:
             return
         current_rate = self._selected_rate()
@@ -388,9 +397,11 @@ class AudioSettingsWindow:
                 self.track_inputs,
                 self.bus_outputs,
             )
-        self._update_sample_rates(current_rate)
+        await self._update_sample_rates(current_rate)
 
-    def _update_sample_rates(self, preferred_rate: int | None = None) -> None:
+    async def _update_sample_rates(
+        self, preferred_rate: int | None = None
+    ) -> None:
         previous_updating = self._updating
         self._updating = True
         try:
@@ -419,7 +430,8 @@ class AudioSettingsWindow:
                 )
                 return
 
-            rates = self.service.supported_sample_rates(
+            rates = await asyncio.to_thread(
+                self.service.supported_sample_rates,
                 input_choice.device.index,
                 output_choice.device.index,
                 self.track_inputs,
@@ -817,16 +829,26 @@ class AudioSettingsWindow:
             buffer_size=self._selected_buffer_size(),
         )
 
-    def _save(self, widget: toga.Widget, **kwargs: object) -> None:
+    async def _save(self, widget: toga.Widget, **kwargs: object) -> None:
         settings = self._selected_settings()
         if settings is None:
             return
+        self.save_button.enabled = False
+        self.cancel_button.enabled = False
+        previous_status = self.status_label.text
+        self.status_label.text = "Applying audio settings…"
         try:
-            self.on_applied(settings)
+            result = self.on_applied(settings)
+            if isawaitable(result):
+                await result
         except (AudioConfigurationError, RuntimeError) as exc:
             self.status_label.text = str(exc)
+            self.save_button.enabled = True
+            self.cancel_button.enabled = True
             return
 
+        self.cancel_button.enabled = True
+        self.status_label.text = previous_status
         self.window.hide()
 
     def _cancel(self, widget: toga.Widget | None = None, **kwargs: object) -> None:

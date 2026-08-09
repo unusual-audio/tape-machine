@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,13 +24,33 @@ from tape_machine.audio import (
 )
 
 
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 # Fourteen compact launcher rows fit above the fixed main-window footer.
 MAX_RECENT_FILES = 14
 
 
 class AppConfigError(RuntimeError):
     """Raised when application configuration cannot be loaded or saved."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigLoadResult:
+    """Recovered application configuration and user-facing diagnostics."""
+
+    config: AppConfig
+    recovered_sections: tuple[str, ...] = ()
+    reset_sections: tuple[str, ...] = ()
+    backup_path: Path | None = None
+
+    @property
+    def recovered(self) -> bool:
+        return bool(self.backup_path or self.reset_sections)
+
+    @property
+    def notice_required(self) -> bool:
+        return any(
+            section != "configuration version" for section in self.reset_sections
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,32 +158,75 @@ class AppConfigStore:
         self.path = path
 
     def load(self) -> AppConfig:
+        """Load configuration, recovering valid sections when necessary."""
+        return self.load_with_recovery().config
+
+    def load_with_recovery(self) -> ConfigLoadResult:
         if not self.path.exists():
-            return AppConfig()
+            return ConfigLoadResult(AppConfig())
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            text = self.path.read_text(encoding="utf-8")
+        except UnicodeError:
+            return self._recover_config(
+                AppConfig(), recovered_sections=(), reset_sections=("all settings",)
+            )
+        except OSError as exc:
             raise AppConfigError(
                 f"Unable to load application configuration: {exc}"
             ) from exc
-        if not isinstance(raw, dict):
-            raise AppConfigError("Application configuration must be a JSON object.")
-        schema_version = raw.get("schema_version")
-        if (
-            not isinstance(schema_version, int)
-            or isinstance(schema_version, bool)
-            or schema_version != CONFIG_SCHEMA_VERSION
-        ):
-            raise AppConfigError(
-                "Application configuration has an unsupported version."
+        try:
+            raw = json.loads(text)
+        except (UnicodeError, json.JSONDecodeError):
+            return self._recover_config(
+                AppConfig(), recovered_sections=(), reset_sections=("all settings",)
             )
+        if not isinstance(raw, dict):
+            return self._recover_config(
+                AppConfig(), recovered_sections=(), reset_sections=("all settings",)
+            )
+        schema_version = raw.get("schema_version")
+        schema_supported = (
+            isinstance(schema_version, int)
+            and not isinstance(schema_version, bool)
+            and schema_version == CONFIG_SCHEMA_VERSION
+        )
 
-        recent_files = _parse_recent_files(raw.get("recent_files"))
+        recovered_sections: list[str] = []
+        reset_sections: list[str] = []
+        raw_recent_files = raw.get("recent_files")
+        recent_files_valid = isinstance(raw_recent_files, list) and all(
+            isinstance(item, str) for item in raw_recent_files
+        )
+        recent_files = (
+            _parse_recent_files(raw_recent_files)
+            if recent_files_valid
+            else ()
+        )
+        if recent_files_valid:
+            recovered_sections.append("recent projects")
+        else:
+            reset_sections.append("recent projects")
         audio_settings = _parse_audio_settings(raw.get("audio_settings"))
+        if raw.get("audio_settings") is None or audio_settings is not None:
+            recovered_sections.append("audio settings")
+        else:
+            reset_sections.append("audio settings")
         positions = raw.get("window_positions")
-        if not isinstance(positions, dict):
+        positions_valid = isinstance(positions, dict) and all(
+            value is None or _parse_position(value) is not None
+            for value in (
+                positions.get("main") if isinstance(positions, dict) else None,
+                positions.get("audio_settings")
+                if isinstance(positions, dict)
+                else None,
+            )
+        )
+        if not positions_valid:
             positions = {}
-        return AppConfig(
+            reset_sections.append("window positions")
+        else:
+            recovered_sections.append("window positions")
+        config = AppConfig(
             recent_files=recent_files,
             audio_settings=audio_settings,
             main_window_position=_parse_position(positions.get("main")),
@@ -169,6 +234,50 @@ class AppConfigStore:
                 positions.get("audio_settings")
             ),
         )
+        if schema_supported and not reset_sections:
+            return ConfigLoadResult(config)
+        if not schema_supported:
+            reset_sections.insert(0, "configuration version")
+        return self._recover_config(
+            config,
+            recovered_sections=tuple(recovered_sections),
+            reset_sections=tuple(reset_sections),
+        )
+
+    def _recover_config(
+        self,
+        config: AppConfig,
+        *,
+        recovered_sections: tuple[str, ...],
+        reset_sections: tuple[str, ...],
+    ) -> ConfigLoadResult:
+        backup_path = self._backup_path()
+        try:
+            shutil.copy2(self.path, backup_path)
+            self.save(config)
+        except OSError as exc:
+            raise AppConfigError(
+                f"Unable to recover application configuration: {exc}"
+            ) from exc
+        return ConfigLoadResult(
+            config,
+            recovered_sections,
+            reset_sections,
+            backup_path,
+        )
+
+    def _backup_path(self) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        candidate = self.path.with_name(
+            f"{self.path.stem}.invalid-{timestamp}{self.path.suffix}"
+        )
+        counter = 2
+        while candidate.exists():
+            candidate = self.path.with_name(
+                f"{self.path.stem}.invalid-{timestamp}-{counter}{self.path.suffix}"
+            )
+            counter += 1
+        return candidate
 
     def save(self, config: AppConfig) -> None:
         payload = {
@@ -199,6 +308,7 @@ class AppConfigStore:
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_path, self.path)
+            _fsync_directory(self.path.parent)
         except OSError as exc:
             raise AppConfigError(
                 f"Unable to save application configuration: {exc}"
@@ -239,7 +349,24 @@ def _parse_device_reference(value: Any) -> DeviceReference | None:
         return None
     if not isinstance(host_api, str) or not host_api:
         return None
-    return DeviceReference(name=name, host_api=host_api)
+    max_input_channels = _optional_nonnegative_int(value.get("max_input_channels"))
+    max_output_channels = _optional_nonnegative_int(value.get("max_output_channels"))
+    default_sample_rate = _optional_positive_int(value.get("default_sample_rate"))
+    raw_signature = value.get("channel_name_signature")
+    signature = (
+        tuple(raw_signature)
+        if isinstance(raw_signature, list)
+        and all(isinstance(item, str) for item in raw_signature)
+        else ()
+    )
+    return DeviceReference(
+        name=name,
+        host_api=host_api,
+        max_input_channels=max_input_channels,
+        max_output_channels=max_output_channels,
+        default_sample_rate=default_sample_rate,
+        channel_name_signature=signature,
+    )
 
 
 def _parse_routes(
@@ -338,8 +465,15 @@ def _parse_position(value: Any) -> WindowPosition | None:
     return WindowPosition(x=x, y=y)
 
 
-def _device_reference_payload(reference: DeviceReference) -> dict[str, str]:
-    return {"name": reference.name, "host_api": reference.host_api}
+def _device_reference_payload(reference: DeviceReference) -> dict[str, Any]:
+    return {
+        "name": reference.name,
+        "host_api": reference.host_api,
+        "max_input_channels": reference.max_input_channels,
+        "max_output_channels": reference.max_output_channels,
+        "default_sample_rate": reference.default_sample_rate,
+        "channel_name_signature": list(reference.channel_name_signature),
+    }
 
 
 def _audio_settings_payload(
@@ -364,3 +498,30 @@ def _position_payload(position: WindowPosition | None) -> dict[str, int] | None:
     if position is None:
         return None
     return {"x": position.x, "y": position.y}
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else None
+    )
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        else None
+    )
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass

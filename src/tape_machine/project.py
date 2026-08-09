@@ -191,6 +191,7 @@ class AudioProject:
         self.audio_file = audio_file
         self.metadata = metadata
         self.dirty = dirty
+        self._metadata_generation = 0
 
     @classmethod
     def create(
@@ -201,25 +202,47 @@ class AudioProject:
     ) -> AudioProject:
         """Create and keep open an empty eight-channel RF64 project."""
         path = Path(path)
+        temporary_path: Path | None = None
         audio_file: soundfile.SoundFile | None = None
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = tempfile.NamedTemporaryFile(
+                prefix=f".{path.name}.",
+                suffix=".tmp.wav",
+                dir=path.parent,
+                delete=False,
+            )
+            temporary_path = Path(temporary.name)
+            temporary.close()
             audio_file = soundfile.SoundFile(
-                path,
+                temporary_path,
                 mode="w+",
                 samplerate=sample_rate,
                 channels=PROJECT_TRACK_COUNT,
                 subtype="PCM_24",
                 format="RF64",
             )
-            project = cls(path, audio_file, metadata, dirty=True)
+            project = cls(temporary_path, audio_file, metadata, dirty=True)
             project.save()
-            return project
+            audio_file.close()
+            audio_file = None
+            sync_fd = os.open(temporary_path, os.O_RDONLY)
+            try:
+                os.fsync(sync_fd)
+            finally:
+                os.close(sync_fd)
+            os.replace(temporary_path, path)
+            _fsync_directory(path.parent)
+            final_file = soundfile.SoundFile(path, mode="r+")
+            return cls(path, final_file, metadata, dirty=False)
         except Exception as exc:
             if audio_file is not None:
                 try:
                     audio_file.close()
                 except Exception:
                     pass
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
             raise ProjectError(f"Unable to create project: {exc}") from exc
 
     @classmethod
@@ -292,11 +315,11 @@ class AudioProject:
 
     def save(self, metadata: ProjectMetadata | None = None) -> None:
         """Write project metadata and flush audio without changing state on failure."""
+        generation = self._metadata_generation
         candidate = metadata or self.metadata
         if "+" not in self.audio_file.mode and "w" not in self.audio_file.mode:
             self._rewrite_for_metadata(candidate)
-            self.metadata = candidate
-            self.dirty = False
+            self._finish_metadata_save(candidate, generation)
             return
 
         previous_comment = self.audio_file.comment
@@ -310,27 +333,46 @@ class AudioProject:
             except Exception:
                 pass
             raise ProjectError(f"Unable to save project metadata: {exc}") from exc
-        self.metadata = candidate
-        self.dirty = False
+        self._finish_metadata_save(candidate, generation)
+
+    def _finish_metadata_save(
+        self, candidate: ProjectMetadata, generation: int
+    ) -> None:
+        """Mark only an unchanged in-memory snapshot as persisted."""
+        if self._metadata_generation == generation:
+            self.metadata = candidate
+            self.dirty = False
 
     def stage_metadata(self, metadata: ProjectMetadata) -> None:
         """Update project metadata in memory and mark it for an explicit save."""
         if metadata != self.metadata:
             self.metadata = metadata
             self.dirty = True
+            self._metadata_generation += 1
 
     def open_playback_reader(self) -> soundfile.SoundFile:
         """Open an independent read handle for transport playback."""
         writable = self.writable
+        previous_mode = "r+" if writable else "r"
         try:
             # libsndfile finalizes the RF64 length header when the writer is
             # closed. Rotate it before opening a concurrent playback reader.
             self.audio_file.close()
-            self.audio_file = soundfile.SoundFile(
-                self.path, mode="r+" if writable else "r"
-            )
+            try:
+                self.audio_file = soundfile.SoundFile(
+                    self.path, mode=previous_mode
+                )
+            except Exception:
+                # Preserve a usable project when write access disappears while
+                # rotating the RF64 handle (for example after a volume change).
+                self.audio_file = soundfile.SoundFile(self.path, mode="r")
             return soundfile.SoundFile(self.path, mode="r")
         except Exception as exc:
+            if self.audio_file.closed:
+                try:
+                    self.audio_file = soundfile.SoundFile(self.path, mode="r")
+                except Exception:
+                    pass
             raise ProjectError(
                 f"Unable to open project audio for playback: {exc}"
             ) from exc
@@ -399,6 +441,33 @@ class AudioProject:
         except Exception as exc:
             raise ProjectError(f"Unable to write recorded audio: {exc}") from exc
 
+    def write_routed_recording_block(
+        self,
+        position: int,
+        track_data: np.ndarray,
+        armed_tracks: tuple[bool, ...],
+    ) -> None:
+        """Replace armed tracks from an already-routed callback block."""
+        if not self.writable:
+            raise ProjectError("This project file is read-only and cannot record.")
+        if (
+            track_data.ndim != 2
+            or track_data.shape[1] != PROJECT_TRACK_COUNT
+            or len(armed_tracks) != PROJECT_TRACK_COUNT
+        ):
+            raise ProjectError("Recording requires exactly eight project tracks.")
+        if position > self.frames:
+            self._extend_with_silence(position)
+        block = self.read_audio_block(position, len(track_data))
+        for track_index, armed in enumerate(armed_tracks):
+            if armed:
+                block[:, track_index] = track_data[:, track_index]
+        try:
+            self.audio_file.seek(position)
+            self.audio_file.write(block)
+        except Exception as exc:
+            raise ProjectError(f"Unable to write recorded audio: {exc}") from exc
+
     def _extend_with_silence(self, target_frames: int) -> None:
         """Materialize a silent gap before recording beyond the current EOF."""
         try:
@@ -454,8 +523,14 @@ class AudioProject:
                 target.comment = metadata.to_comment()
                 target.flush()
 
+            sync_fd = os.open(temp_path, os.O_RDONLY)
+            try:
+                os.fsync(sync_fd)
+            finally:
+                os.close(sync_fd)
             source.close()
             os.replace(temp_path, self.path)
+            _fsync_directory(self.path.parent)
             self.audio_file = soundfile.SoundFile(self.path, mode="r+")
         except Exception as exc:
             if not source.closed:
@@ -544,3 +619,16 @@ def _transfer_dtype(subtype: str) -> str:
     if subtype == "FLOAT":
         return "float32"
     return "int32"
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort durability for an atomic file replacement."""
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        # Some filesystems do not permit directory fsync.
+        pass
