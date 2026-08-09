@@ -10,7 +10,11 @@ from time import monotonic
 
 import numpy as np
 
-from tape_machine.audio import PROJECT_TRACK_COUNT
+from tape_machine.audio import (
+    PROJECT_TRACK_COUNT,
+    STEREO_BUS_CHANNEL_COUNT,
+    TrackInputRoute,
+)
 from tape_machine.project import AudioProject, ProjectError
 
 
@@ -44,7 +48,17 @@ class TransportError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class CaptureBlock:
     position: int
-    data: np.ndarray
+    input_data: np.ndarray
+    stereo_bus: np.ndarray
+    armed_tracks: tuple[bool, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureContext:
+    """Callback-local recording state awaiting the rendered stereo bus."""
+
+    position: int
+    frames: int
     armed_tracks: tuple[bool, ...]
 
 
@@ -73,7 +87,9 @@ class TransportController:
         self.end_requested = False
         self.terminal_error: str | None = None
 
-        self._track_inputs: tuple[int | None, ...] = (None,) * PROJECT_TRACK_COUNT
+        self._track_inputs: tuple[TrackInputRoute, ...] = (
+            None,
+        ) * PROJECT_TRACK_COUNT
         self._armed_tracks: tuple[bool, ...] = (False,) * PROJECT_TRACK_COUNT
         self._known_frames = project.frames
         self._playback_end_frames = project.frames
@@ -134,7 +150,7 @@ class TransportController:
 
     def play(
         self,
-        track_inputs: tuple[int | None, ...],
+        track_inputs: tuple[TrackInputRoute, ...],
         armed_tracks: tuple[bool, ...],
     ) -> bool:
         """Prebuffer and start transport at the current frame position."""
@@ -212,16 +228,19 @@ class TransportController:
         self.mode = mode
         return True
 
-    def process_audio(
-        self, indata: np.ndarray, frames: int, status: object
-    ) -> np.ndarray | None:
-        """Consume playback and enqueue capture without blocking the callback."""
+    def prepare_audio(
+        self, frames: int, status: object
+    ) -> tuple[np.ndarray | None, CaptureContext | None]:
+        """Consume playback and return capture state for the rendered bus."""
         if not self.running:
-            return None
+            return None, None
         mode = self.mode
         start_position = self.position_frames
         if mode.shuttling:
-            return self._process_shuttle_audio(frames, mode, start_position)
+            return (
+                self._process_shuttle_audio(frames, mode, start_position),
+                None,
+            )
         record_armed = self.record_armed
         armed_tracks = self._armed_tracks
         recording = record_armed and any(armed_tracks)
@@ -241,17 +260,12 @@ class TransportController:
             self.end_requested = True
             reached_end = True
 
+        capture_context = None
         if recording:
             playback[:, armed_tracks] = 0
-            try:
-                self._capture_queue.put_nowait(
-                    CaptureBlock(start_position, indata.copy(), armed_tracks)
-                )
-                self._known_frames = max(
-                    self._known_frames, start_position + frames
-                )
-            except Full:
-                self._fail("Recording buffer overflowed; the disk is too slow.")
+            capture_context = CaptureContext(
+                start_position, frames, armed_tracks
+            )
             if status:
                 self._fail(f"Audio dropout while recording: {status}")
 
@@ -259,6 +273,53 @@ class TransportController:
             self.position_frames = self._known_frames
         else:
             self.position_frames += frames
+        return playback, capture_context
+
+    def submit_capture(
+        self,
+        context: object,
+        input_data: np.ndarray,
+        stereo_bus: np.ndarray,
+    ) -> None:
+        """Enqueue device inputs and the rendered bus without blocking."""
+        if not isinstance(context, CaptureContext):
+            self._fail("Recording received an invalid capture context.")
+            return
+        if (
+            input_data.shape[0] != context.frames
+            or stereo_bus.shape
+            != (context.frames, STEREO_BUS_CHANNEL_COUNT)
+        ):
+            self._fail("Recording received an invalid audio block.")
+            return
+        try:
+            self._capture_queue.put_nowait(
+                CaptureBlock(
+                    context.position,
+                    input_data.copy(),
+                    stereo_bus.copy(),
+                    context.armed_tracks,
+                )
+            )
+            self._known_frames = max(
+                self._known_frames, context.position + context.frames
+            )
+        except Full:
+            self._fail("Recording buffer overflowed; the disk is too slow.")
+
+    def process_audio(
+        self, indata: np.ndarray, frames: int, status: object
+    ) -> np.ndarray | None:
+        """Compatibility helper for callers without an internal bus renderer."""
+        playback, context = self.prepare_audio(frames, status)
+        if context is not None:
+            self.submit_capture(
+                context,
+                indata,
+                np.zeros(
+                    (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+                ),
+            )
         return playback
 
     def _process_shuttle_audio(
@@ -358,12 +419,13 @@ class TransportController:
             return False
         self.project.write_recording_block(
             capture.position,
-            capture.data,
+            capture.input_data,
+            capture.stereo_bus,
             self._track_inputs,
             capture.armed_tracks,
         )
         self._known_frames = max(
-            self._known_frames, capture.position + len(capture.data)
+            self._known_frames, capture.position + len(capture.input_data)
         )
         return True
 

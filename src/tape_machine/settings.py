@@ -17,6 +17,9 @@ from tape_machine.audio import (
     AudioDevice,
     AudioDeviceService,
     AudioSettings,
+    StereoBusInput,
+    TrackInputRoute,
+    is_physical_input,
 )
 
 
@@ -43,6 +46,41 @@ class SampleRateChoice:
         return f"{self.value / 1_000:g} kHz"
 
 
+def input_source_rows(
+    input_device: AudioDevice,
+    track_inputs: tuple[TrackInputRoute, ...],
+) -> tuple[tuple[TrackInputRoute, str], ...]:
+    """Return physical and virtual rows shown by the input matrix."""
+    stored_input_count = max(
+        (
+            channel
+            for channel in track_inputs
+            if is_physical_input(channel)
+        ),
+        default=-1,
+    ) + 1
+    row_count = max(input_device.max_input_channels, stored_input_count)
+    rows: list[tuple[TrackInputRoute, str]] = [
+        (
+            input_channel,
+            f"Input {input_channel + 1}"
+            + (
+                ""
+                if input_channel < input_device.max_input_channels
+                else " (unavailable)"
+            ),
+        )
+        for input_channel in range(row_count)
+    ]
+    rows.extend(
+        (
+            (StereoBusInput.LEFT, "Stereo bus L"),
+            (StereoBusInput.RIGHT, "Stereo bus R"),
+        )
+    )
+    return tuple(rows)
+
+
 @dataclass(frozen=True, slots=True)
 class AudioSettingsDraft:
     """Editable audio state, including projects without resolved devices."""
@@ -50,7 +88,7 @@ class AudioSettingsDraft:
     input_device_id: int | None
     output_device_id: int | None
     sample_rate: int | None
-    track_inputs: tuple[int | None, ...] = UNASSIGNED_TRACK_INPUTS
+    track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS
     bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
 
     @classmethod
@@ -73,17 +111,23 @@ class AudioSettingsWindow:
         self,
         service: AudioDeviceService,
         on_applied: Callable[[AudioSettings], None],
+        on_save_as_default: Callable[[AudioSettings], None],
+        *,
+        position: tuple[int, int] | None = None,
     ) -> None:
         self.service = service
         self.default_on_applied = on_applied
         self.on_applied = on_applied
+        self.on_save_as_default = on_save_as_default
         self.draft = AudioSettingsDraft.from_settings(None)
         self.locked_sample_rate: int | None = None
         self.trusted_settings: AudioSettings | None = None
         self._updating = False
         self.track_inputs = UNASSIGNED_TRACK_INPUTS
         self.bus_outputs = UNASSIGNED_BUS_OUTPUTS
-        self.route_switches: dict[tuple[int, int], toga.Switch] = {}
+        self.route_switches: dict[
+            tuple[TrackInputRoute, int], toga.Switch
+        ] = {}
         self.output_route_switches: dict[tuple[int, int], toga.Switch] = {}
 
         self.input_selection = toga.Selection(
@@ -103,6 +147,22 @@ class AudioSettingsWindow:
         self.save_button = toga.Button(
             "Save", on_press=self._save, enabled=False, margin_left=8
         )
+        self.save_as_default_button = toga.Button(
+            "Save as Default",
+            on_press=self._save_as_default,
+            enabled=False,
+            margin_left=8,
+        )
+        self.button_row = toga.Box(
+            children=[
+                toga.Button("Cancel", on_press=self._cancel),
+                self.save_button,
+            ],
+            direction=ROW,
+            justify_content=END,
+            margin_top=20,
+        )
+        self._save_as_default_visible = False
 
         content = toga.Box(
             children=[
@@ -118,15 +178,7 @@ class AudioSettingsWindow:
                 toga.Divider(margin_top=8, margin_bottom=16),
                 self.routing_scroll,
                 self.status_label,
-                toga.Box(
-                    children=[
-                        toga.Button("Cancel", on_press=self._cancel),
-                        self.save_button,
-                    ],
-                    direction=ROW,
-                    justify_content=END,
-                    margin_top=20,
-                ),
+                self.button_row,
             ],
             direction=COLUMN,
             margin=24,
@@ -134,6 +186,7 @@ class AudioSettingsWindow:
 
         self.window = toga.Window(
             title="Audio Settings",
+            position=position,
             size=(900, 640),
             resizable=True,
             minimizable=False,
@@ -159,9 +212,11 @@ class AudioSettingsWindow:
         locked_sample_rate: int | None = None,
         trusted_settings: AudioSettings | None = None,
         on_applied: Callable[[AudioSettings], None] | None = None,
+        allow_save_as_default: bool = False,
     ) -> None:
         """Refresh and show the window, or leave an already-visible draft intact."""
         if self.window.visible:
+            self._set_save_as_default_visible(allow_save_as_default)
             return
         self.draft = draft or AudioSettingsDraft.from_settings(
             self.service.current_settings
@@ -169,13 +224,27 @@ class AudioSettingsWindow:
         self.locked_sample_rate = locked_sample_rate
         self.trusted_settings = trusted_settings
         self.on_applied = on_applied or self.default_on_applied
+        self._set_save_as_default_visible(allow_save_as_default)
         self._load_draft()
         self.window.show()
+
+    def _set_save_as_default_visible(self, visible: bool) -> None:
+        if visible == self._save_as_default_visible:
+            return
+        self._save_as_default_visible = visible
+        if visible:
+            self.button_row.insert(1, self.save_as_default_button)
+        else:
+            self.button_row.remove(self.save_as_default_button)
+
+    def _set_save_enabled(self, enabled: bool) -> None:
+        self.save_button.enabled = enabled
+        self.save_as_default_button.enabled = enabled
 
     def _load_draft(self) -> None:
         self._updating = True
         self.status_label.text = ""
-        self.save_button.enabled = False
+        self._set_save_enabled(False)
         try:
             inputs, outputs = self.service.refresh_devices()
             self.input_selection.items = [
@@ -288,7 +357,7 @@ class AudioSettingsWindow:
             ):
                 self.sample_rate_selection.items = []
                 self.sample_rate_selection.enabled = False
-                self.save_button.enabled = False
+                self._set_save_enabled(False)
                 self._show_inventory_problem()
                 return
 
@@ -309,7 +378,7 @@ class AudioSettingsWindow:
                     if candidate == self.trusted_settings
                     else self.service.compatibility_error(candidate)
                 )
-                self.save_button.enabled = compatibility_error is None
+                self._set_save_enabled(compatibility_error is None)
                 self.status_label.text = compatibility_error or (
                     "Project sample rate is fixed by the WAV file."
                 )
@@ -325,7 +394,7 @@ class AudioSettingsWindow:
             self.sample_rate_selection.items = choices
             self.sample_rate_selection.enabled = bool(choices)
             if not choices:
-                self.save_button.enabled = False
+                self._set_save_enabled(False)
                 self.status_label.text = (
                     "The selected devices have no supported studio "
                     "sample rate in common."
@@ -341,11 +410,11 @@ class AudioSettingsWindow:
             )
             self.sample_rate_selection.value = SampleRateChoice(selected_rate)
             self.status_label.text = ""
-            self.save_button.enabled = True
+            self._set_save_enabled(True)
         except AudioConfigurationError as exc:
             self.sample_rate_selection.items = []
             self.sample_rate_selection.enabled = False
-            self.save_button.enabled = False
+            self._set_save_enabled(False)
             self.status_label.text = str(exc)
         finally:
             self._updating = previous_updating
@@ -362,7 +431,7 @@ class AudioSettingsWindow:
         self,
         input_device: AudioDevice | None,
         output_device: AudioDevice | None,
-        track_inputs: tuple[int | None, ...],
+        track_inputs: tuple[TrackInputRoute, ...],
         bus_outputs: tuple[int | None, ...],
     ) -> None:
         self.track_inputs = track_inputs
@@ -408,7 +477,7 @@ class AudioSettingsWindow:
     def _build_input_routing_matrix(
         self,
         input_device: AudioDevice | None,
-        track_inputs: tuple[int | None, ...],
+        track_inputs: tuple[TrackInputRoute, ...],
     ) -> toga.Widget:
         if input_device is None:
             return toga.Label(
@@ -433,7 +502,7 @@ class AudioSettingsWindow:
         )
         header = toga.Box(
             children=[
-                toga.Label("Device input", width=label_width),
+                toga.Label("Input source", width=label_width),
                 *[
                     toga.Label(
                         str(track_index + 1),
@@ -447,21 +516,13 @@ class AudioSettingsWindow:
             margin_bottom=8,
         )
 
-        stored_input_count = max(
-            (channel for channel in track_inputs if channel is not None),
-            default=-1,
-        ) + 1
-        row_count = max(input_device.max_input_channels, stored_input_count)
         rows: list[toga.Box] = []
-        for input_channel in range(row_count):
-            availability = (
-                ""
-                if input_channel < input_device.max_input_channels
-                else " (unavailable)"
-            )
+        for input_channel, input_label in input_source_rows(
+            input_device, track_inputs
+        ):
             cells: list[toga.Widget] = [
                 toga.Label(
-                    f"Input {input_channel + 1}{availability}",
+                    input_label,
                     width=label_width,
                     margin_top=4,
                 )
@@ -469,7 +530,11 @@ class AudioSettingsWindow:
             for track_index in range(PROJECT_TRACK_COUNT):
                 route_switch = toga.Switch(
                     "\u200b",
-                    id=f"input-{input_channel + 1}-track-{track_index + 1}",
+                    id=(
+                        f"input-{input_channel + 1}-track-{track_index + 1}"
+                        if is_physical_input(input_channel)
+                        else f"{input_channel.value}-track-{track_index + 1}"
+                    ),
                     value=track_inputs[track_index] == input_channel,
                     on_change=self._route_handler(input_channel, track_index),
                 )
@@ -579,7 +644,9 @@ class AudioSettingsWindow:
             margin_top=12,
         )
 
-    def _route_handler(self, input_channel: int, track_index: int):
+    def _route_handler(
+        self, input_channel: TrackInputRoute, track_index: int
+    ):
         def handler(widget: toga.Switch, **kwargs: object) -> None:
             self._on_route_changed(widget, input_channel, track_index)
 
@@ -588,7 +655,7 @@ class AudioSettingsWindow:
     def _on_route_changed(
         self,
         widget: toga.Switch,
-        input_channel: int,
+        input_channel: TrackInputRoute,
         track_index: int,
     ) -> None:
         if self._updating:
@@ -680,7 +747,7 @@ class AudioSettingsWindow:
         choice = self.sample_rate_selection.value
         return choice.value if isinstance(choice, SampleRateChoice) else None
 
-    def _save(self, widget: toga.Widget, **kwargs: object) -> None:
+    def _selected_settings(self) -> AudioSettings | None:
         input_choice = self.input_selection.value
         output_choice = self.output_selection.value
         sample_rate = self._selected_rate()
@@ -689,17 +756,22 @@ class AudioSettingsWindow:
             or not isinstance(output_choice, DeviceChoice)
             or sample_rate is None
         ):
-            self.save_button.enabled = False
+            self._set_save_enabled(False)
             self.status_label.text = "Choose an input, output, and sample rate."
-            return
+            return None
 
-        settings = AudioSettings(
+        return AudioSettings(
             input_device_id=input_choice.device.index,
             output_device_id=output_choice.device.index,
             sample_rate=sample_rate,
             track_inputs=self.track_inputs,
             bus_outputs=self.bus_outputs,
         )
+
+    def _save(self, widget: toga.Widget, **kwargs: object) -> None:
+        settings = self._selected_settings()
+        if settings is None:
+            return
         try:
             self.on_applied(settings)
         except (AudioConfigurationError, RuntimeError) as exc:
@@ -707,6 +779,19 @@ class AudioSettingsWindow:
             return
 
         self.window.hide()
+
+    def _save_as_default(self, widget: toga.Widget, **kwargs: object) -> None:
+        settings = self._selected_settings()
+        if settings is None:
+            return
+        try:
+            self.on_applied(settings)
+            self.on_save_as_default(settings)
+        except (AudioConfigurationError, RuntimeError) as exc:
+            self.status_label.text = str(exc)
+            return
+
+        self.status_label.text = "Applied and saved as default."
 
     def _cancel(self, widget: toga.Widget | None = None, **kwargs: object) -> None:
         self.window.hide()

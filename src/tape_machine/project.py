@@ -19,11 +19,14 @@ from tape_machine.audio import (
     UNASSIGNED_BUS_OUTPUTS,
     UNASSIGNED_TRACK_INPUTS,
     DeviceReference,
+    StereoBusInput,
+    TrackInputRoute,
+    is_physical_input,
 )
 
 
 PROJECT_APPLICATION_ID = "pkg.unusualaudio.tape-machine"
-PROJECT_SCHEMA_VERSION = 2
+PROJECT_SCHEMA_VERSION = 3
 PROJECT_COMMENT_PREFIX = "TAPE_MACHINE_PROJECT:"
 WAV_FORMATS = {"WAV", "WAVEX", "RF64"}
 MIX_MIN_LEVEL_DB = -60.0
@@ -89,7 +92,7 @@ class ProjectMetadata:
 
     input_device: DeviceReference | None = None
     output_device: DeviceReference | None = None
-    track_inputs: tuple[int | None, ...] = UNASSIGNED_TRACK_INPUTS
+    track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS
     bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
     source_comment: str | None = None
     mix: MixerMetadata = field(default_factory=MixerMetadata)
@@ -103,9 +106,8 @@ class ProjectMetadata:
             )
         for channel in self.track_inputs:
             if channel is not None and (
-                not isinstance(channel, int)
-                or isinstance(channel, bool)
-                or channel < 0
+                not isinstance(channel, StereoBusInput)
+                and (not is_physical_input(channel) or channel < 0)
             ):
                 raise ValueError(f"Invalid project input channel {channel!r}.")
 
@@ -131,7 +133,7 @@ class ProjectMetadata:
         self,
         input_device: DeviceReference,
         output_device: DeviceReference,
-        track_inputs: tuple[int | None, ...],
+        track_inputs: tuple[TrackInputRoute, ...],
         bus_outputs: tuple[int | None, ...],
     ) -> ProjectMetadata:
         """Return metadata updated from saved Audio Settings."""
@@ -154,7 +156,10 @@ class ProjectMetadata:
             "schema_version": PROJECT_SCHEMA_VERSION,
             "input_device": _reference_payload(self.input_device),
             "output_device": _reference_payload(self.output_device),
-            "track_inputs": list(self.track_inputs),
+            "track_inputs": [
+                route.value if isinstance(route, StereoBusInput) else route
+                for route in self.track_inputs
+            ],
             "bus_outputs": list(self.bus_outputs),
             "mix": _mixer_payload(self.mix),
         }
@@ -181,14 +186,16 @@ class ProjectMetadata:
         if (
             not isinstance(schema_version, int)
             or isinstance(schema_version, bool)
-            or schema_version not in {1, PROJECT_SCHEMA_VERSION}
+            or schema_version not in {1, 2, PROJECT_SCHEMA_VERSION}
         ):
             raise ProjectError(
                 "This project uses an unsupported metadata schema version."
             )
 
         try:
-            track_inputs = tuple(payload["track_inputs"])
+            track_inputs = _track_inputs_from_payload(
+                payload["track_inputs"], allow_loopback=schema_version >= 3
+            )
             bus_outputs = tuple(payload["bus_outputs"])
             source_comment = payload.get("source_comment")
             if source_comment is not None and not isinstance(source_comment, str):
@@ -372,7 +379,8 @@ class AudioProject:
         self,
         position: int,
         input_data: np.ndarray,
-        track_inputs: tuple[int | None, ...],
+        stereo_bus: np.ndarray,
+        track_inputs: tuple[TrackInputRoute, ...],
         armed_tracks: tuple[bool, ...],
     ) -> None:
         """Replace armed tracks while preserving every unarmed channel."""
@@ -382,13 +390,24 @@ class AudioProject:
             PROJECT_TRACK_COUNT
         ):
             raise ProjectError("Recording requires exactly eight project tracks.")
+        if stereo_bus.shape != (len(input_data), STEREO_BUS_CHANNEL_COUNT):
+            raise ProjectError("Recording requires a two-channel stereo bus block.")
         block = self.read_audio_block(position, len(input_data))
         for track_index, (input_channel, armed) in enumerate(
             zip(track_inputs, armed_tracks, strict=True)
         ):
             if not armed:
                 continue
-            if input_channel is None or input_channel >= input_data.shape[1]:
+            if isinstance(input_channel, StereoBusInput):
+                bus_channel = 0 if input_channel is StereoBusInput.LEFT else 1
+                block[:, track_index] = np.clip(
+                    stereo_bus[:, bus_channel], -1.0, 1.0
+                )
+            elif (
+                input_channel is None
+                or not is_physical_input(input_channel)
+                or input_channel >= input_data.shape[1]
+            ):
                 block[:, track_index] = 0
             else:
                 block[:, track_index] = input_data[:, input_channel]
@@ -463,6 +482,23 @@ def _reference_payload(reference: DeviceReference | None) -> dict[str, str] | No
     if reference is None:
         return None
     return {"name": reference.name, "host_api": reference.host_api}
+
+
+def _track_inputs_from_payload(
+    payload: object, *, allow_loopback: bool
+) -> tuple[TrackInputRoute, ...]:
+    if not isinstance(payload, list):
+        raise ValueError("track_inputs must be an array")
+    routes: list[TrackInputRoute] = []
+    for route in payload:
+        if isinstance(route, str) and allow_loopback:
+            try:
+                routes.append(StereoBusInput(route))
+            except ValueError as exc:
+                raise ValueError(f"unknown input source {route!r}") from exc
+        else:
+            routes.append(route)
+    return tuple(routes)
 
 
 def _reference_from_payload(payload: object) -> DeviceReference | None:

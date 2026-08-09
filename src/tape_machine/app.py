@@ -1,16 +1,26 @@
 """The Tape Machine Toga application."""
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Callable
 
 import toga
+from rubicon.objc import NSObject, ObjCClass, objc_method
 from toga.style.pack import CENTER, COLUMN, ROW
+from toga_cocoa.libs import NSCursor
 
 from tape_machine.audio import (
     AudioConfigurationError,
     AudioDeviceService,
     AudioSettings,
+)
+from tape_machine.config import (
+    AppConfig,
+    AppConfigError,
+    AppConfigStore,
+    StoredAudioSettings,
+    WindowPosition,
 )
 from tape_machine.engine import AudioEngine, AudioEngineError
 from tape_machine.mixer import MixerState, MixerView
@@ -30,12 +40,94 @@ from tape_machine.transport import (
 
 
 _TRANSPORT_BUTTON_WIDTH = 80
+_MAIN_WINDOW_SIZE = (912, 560)
+_AUDIO_SETTINGS_WINDOW_SIZE = (900, 640)
 _RECORD_BUTTON_TEXT = "● REC"
 _REWIND_BUTTON_TEXT = "◀◀ REW"
 _PLAY_BUTTON_TEXT = "▶ PLAY"
 _RTZ_BUTTON_TEXT = "⇤ RTZ"
 _STOP_BUTTON_TEXT = "■ STOP"
 _FAST_FORWARD_BUTTON_TEXT = "▶▶ FWD"
+_NSTRACKING_IN_VISIBLE_RECT = 0x200
+
+
+class RoutingStatusCursorOwner(NSObject):
+    """Set the pointing-hand cursor while it is over the routing link."""
+
+    @objc_method
+    def cursorUpdate_(self, event) -> None:
+        NSCursor.pointingHandCursor.set()
+
+
+def _fit_window_position(
+    position: WindowPosition | None,
+    window_size: tuple[int, int],
+    screens: list[object],
+) -> tuple[int, int] | None:
+    """Keep a restored window fully visible on an attached screen."""
+    if position is None or not screens:
+        return None
+    target_screen = next(
+        (
+            screen
+            for screen in screens
+            if screen.origin.x <= position.x < screen.origin.x + screen.size.width
+            and screen.origin.y <= position.y < screen.origin.y + screen.size.height
+        ),
+        screens[0],
+    )
+    minimum_x = target_screen.origin.x
+    minimum_y = target_screen.origin.y
+    maximum_x = minimum_x + max(0, target_screen.size.width - window_size[0])
+    maximum_y = minimum_y + max(0, target_screen.size.height - window_size[1])
+    return (
+        max(minimum_x, min(position.x, maximum_x)),
+        max(minimum_y, min(position.y, maximum_y)),
+    )
+
+
+def _style_status_link(button: toga.Button) -> None:
+    """Give a native Cocoa button the appearance of an inline text link."""
+    from toga.colors import Color
+    from toga_cocoa.colors import native_color
+    from toga_cocoa.libs import (
+        NSMutableDictionary,
+        NSAttributedString,
+        NSFontAttributeName,
+        NSForegroundColorAttributeName,
+        NSMakeRect,
+        NSTrackingActiveInActiveApp,
+        NSTrackingCursorUpdate,
+        NSUnderlineStyleAttributeName,
+    )
+
+    native = button._impl.native
+    attributes = NSMutableDictionary.alloc().init()
+    attributes[NSFontAttributeName] = native.font
+    attributes[NSForegroundColorAttributeName] = native_color(
+        Color.parse(ACCENT_RED)
+    )
+    attributes[NSUnderlineStyleAttributeName] = 1
+    native.bordered = False
+    native.toolTip = "Open Audio Settings"
+    native.attributedTitle = NSAttributedString.alloc().initWithString(
+        button.text, attributes=attributes
+    )
+    cursor_owner = RoutingStatusCursorOwner.alloc().init()
+    tracking_area = ObjCClass("NSTrackingArea").alloc().initWithRect(
+        NSMakeRect(0, 0, 0, 0),
+        options=(
+            NSTrackingCursorUpdate
+            | NSTrackingActiveInActiveApp
+            | _NSTRACKING_IN_VISIBLE_RECT
+        ),
+        owner=cursor_owner,
+        userInfo=None,
+    )
+    native.addTrackingArea(tracking_area)
+    button._routing_cursor_owner = cursor_owner
+    button._routing_tracking_area = tracking_area
+    button._impl.rehint()
 
 
 class ShuttleButton:
@@ -127,10 +219,26 @@ class TapeMachine(toga.App):
     def startup(self) -> None:
         """Create and show the main application window."""
         force_dark_appearance(self._impl.native)
+        self.config_store = AppConfigStore(self.paths.config / "config.json")
+        try:
+            self.app_config = self.config_store.load()
+        except AppConfigError as exc:
+            print(exc, file=sys.stderr)
+            self.app_config = AppConfig()
+
         self.audio_service = AudioDeviceService()
         self.audio_engine = AudioEngine()
         try:
-            self.audio_service.initialize()
+            self.audio_service.refresh_devices()
+            stored_audio = self.app_config.default_audio_settings
+            preferred_audio = (
+                stored_audio.resolve(self.audio_service)
+                if stored_audio is not None
+                else None
+            )
+            self.audio_service.current_settings = self.audio_service.suggest_settings(
+                preferred_audio
+            )
             startup_error = None
         except AudioConfigurationError as exc:
             startup_error = str(exc)
@@ -151,16 +259,55 @@ class TapeMachine(toga.App):
         self.audio_engine_error: str | None = None
 
         self.status_line_label = toga.Label("", font_size=11)
+        self.routing_status_link = toga.Button(
+            "Routing incomplete",
+            id="routing-status-link",
+            on_press=self._open_routing_settings,
+            height=18,
+            font_size=11,
+            color=ACCENT_RED,
+        )
+        _style_status_link(self.routing_status_link)
+        self.routing_status_link_group = toga.Box(
+            children=[
+                toga.Label("  •  ", font_size=11),
+                self.routing_status_link,
+            ],
+            direction=ROW,
+            align_items=CENTER,
+        )
+        self._routing_status_link_visible = False
+        self.status_line_suffix_label = toga.Label("", font_size=11)
+        self.status_line_content = toga.Box(
+            children=[
+                self.status_line_label,
+                self.status_line_suffix_label,
+            ],
+            direction=ROW,
+            align_items=CENTER,
+        )
 
         self.main_window = toga.MainWindow(
             title=self.formal_name,
-            size=(912, 560),
+            position=_fit_window_position(
+                self.app_config.main_window_position,
+                _MAIN_WINDOW_SIZE,
+                self.screens,
+            ),
+            size=_MAIN_WINDOW_SIZE,
             resizable=False,
         )
         self.main_window.content = self._build_initial_screen()
 
         self.settings_window = AudioSettingsWindow(
-            self.audio_service, self._session_audio_settings_applied
+            self.audio_service,
+            self._session_audio_settings_applied,
+            self._save_audio_settings_as_default,
+            position=_fit_window_position(
+                self.app_config.audio_settings_window_position,
+                _AUDIO_SETTINGS_WINDOW_SIZE,
+                self.screens,
+            ),
         )
         self.settings_command = toga.Command.standard(
             self, toga.Command.PREFERENCES
@@ -190,6 +337,15 @@ class TapeMachine(toga.App):
             group=toga.Group.FILE,
             section=20,
         )
+        self.recent_files_group = toga.Group(
+            "Open Recent",
+            parent=toga.Group.FILE,
+            section=0,
+            order=20,
+            id="open-recent",
+        )
+        self.recent_file_commands: list[toga.Command] = []
+        self.recent_menu_commands: list[toga.Command] = []
         self.commands.add(
             self.settings_command,
             self.new_project_command,
@@ -197,6 +353,7 @@ class TapeMachine(toga.App):
             self.close_project_command,
             self.save_project_command,
         )
+        self._rebuild_recent_files_menu()
         self._update_command_state()
         self._update_audio_summary(startup_error)
         self.main_window.show()
@@ -325,13 +482,99 @@ class TapeMachine(toga.App):
         return toga.Box(
             children=[
                 toga.Divider(margin_bottom=8),
-                self.status_line_label,
+                self.status_line_content,
             ],
             direction=COLUMN,
             margin_left=16,
             margin_right=16,
             margin_bottom=12,
         )
+
+    def _recent_file_action(self, path: Path) -> Callable[..., object]:
+        async def action(
+            widget: toga.Widget | toga.Command | None = None,
+            **kwargs: object,
+        ) -> None:
+            await self._open_project_path(path)
+
+        return action
+
+    def _rebuild_recent_files_menu(self) -> None:
+        for command in self.recent_menu_commands:
+            self.commands.discard(command)
+
+        file_commands: list[toga.Command] = []
+        menu_commands: list[toga.Command] = []
+        if self.app_config.recent_files:
+            for order, path in enumerate(self.app_config.recent_files):
+                command = toga.Command(
+                    self._recent_file_action(path),
+                    path.name,
+                    tooltip=str(path),
+                    group=self.recent_files_group,
+                    order=order,
+                    enabled=self.project is None,
+                    id=f"open-recent-{order}",
+                )
+                file_commands.append(command)
+                menu_commands.append(command)
+        else:
+            menu_commands.append(
+                toga.Command(
+                    None,
+                    "No Recent Files",
+                    group=self.recent_files_group,
+                    enabled=False,
+                    id="open-recent-empty",
+                )
+            )
+
+        menu_commands.append(
+            toga.Command(
+                self.clear_recent_files,
+                "Clear Menu",
+                group=self.recent_files_group,
+                section=10,
+                enabled=bool(self.app_config.recent_files),
+                id="clear-recent-files",
+            )
+        )
+        self.recent_file_commands = file_commands
+        self.recent_menu_commands = menu_commands
+        self.commands.add(*menu_commands)
+
+    def _persist_noncritical_config(self) -> None:
+        try:
+            self.config_store.save(self.app_config)
+        except AppConfigError as exc:
+            print(exc, file=sys.stderr)
+
+    def _remember_recent_file(self, path: Path) -> None:
+        updated = self.app_config.with_recent_file(path)
+        if updated == self.app_config:
+            return
+        self.app_config = updated
+        self._persist_noncritical_config()
+        self._rebuild_recent_files_menu()
+
+    def _forget_recent_file(self, path: Path) -> None:
+        updated = self.app_config.without_recent_file(path)
+        if updated == self.app_config:
+            return
+        self.app_config = updated
+        self._persist_noncritical_config()
+        self._rebuild_recent_files_menu()
+
+    def clear_recent_files(
+        self,
+        widget: toga.Widget | toga.Command | None = None,
+        **kwargs: object,
+    ) -> None:
+        if not self.app_config.recent_files:
+            return
+        self.app_config = self.app_config.clear_recent_files()
+        self._persist_noncritical_config()
+        self._rebuild_recent_files_menu()
 
     def _update_command_state(self) -> None:
         project_is_open = self.project is not None
@@ -349,13 +592,15 @@ class TapeMachine(toga.App):
         self.save_project_command.enabled = project_is_open and not transport_busy
         self.close_project_command.enabled = project_is_open and not transport_busy
         self.settings_command.enabled = not transport_busy
+        for command in getattr(self, "recent_file_commands", ()):
+            command.enabled = not project_is_open
 
     def preferences(
         self, widget: toga.Widget | toga.Command | None = None, **kwargs: object
     ) -> None:
         """Open session or project-specific Audio Settings."""
         if self.project is None:
-            self.settings_window.open()
+            self.settings_window.open(allow_save_as_default=True)
             return
 
         current = self.audio_service.current_settings
@@ -371,12 +616,39 @@ class TapeMachine(toga.App):
             locked_sample_rate=self.project.sample_rate,
             trusted_settings=(current if self.audio_engine.running else None),
             on_applied=self._project_audio_settings_applied,
+            allow_save_as_default=False,
         )
+
+    def _open_routing_settings(
+        self, widget: toga.Widget | None = None, **kwargs: object
+    ) -> None:
+        self.preferences()
+
+    def _set_routing_status_link_visible(self, visible: bool) -> None:
+        if visible == self._routing_status_link_visible:
+            return
+        self._routing_status_link_visible = visible
+        if visible:
+            self.status_line_content.insert(1, self.routing_status_link_group)
+        else:
+            self.status_line_content.remove(self.routing_status_link_group)
 
     def _session_audio_settings_applied(self, settings: AudioSettings) -> None:
         self.audio_service.apply(settings)
         self.session_audio_settings = settings
         self._update_audio_summary()
+
+    def _save_audio_settings_as_default(self, settings: AudioSettings) -> None:
+        input_device = self.audio_service.device(settings.input_device_id, "input")
+        output_device = self.audio_service.device(settings.output_device_id, "output")
+        if input_device is None or output_device is None:
+            raise AudioConfigurationError("The selected audio devices disappeared.")
+        stored = StoredAudioSettings.from_settings(
+            settings, input_device, output_device
+        )
+        updated = self.app_config.with_default_audio_settings(stored)
+        self.config_store.save(updated)
+        self.app_config = updated
 
     def _project_audio_settings_applied(self, settings: AudioSettings) -> None:
         if self.project is None:
@@ -501,17 +773,25 @@ class TapeMachine(toga.App):
         if path is None:
             return
 
+        await self._open_project_path(Path(path))
+
+    async def _open_project_path(self, path: Path) -> bool:
+        """Open one known path and share handling with the recent-files menu."""
+
         try:
             self.audio_service.refresh_devices()
             import_metadata = ProjectMetadata(
                 input_device=self._default_device_reference("input"),
                 output_device=self._default_device_reference("output"),
             )
-            project = AudioProject.open(Path(path), import_metadata)
+            project = AudioProject.open(path, import_metadata)
         except (AudioConfigurationError, ProjectError) as exc:
+            if not path.exists():
+                self._forget_recent_file(path)
             await self._show_project_error(str(exc))
-            return
+            return False
         self._enter_project(project)
+        return True
 
     def _default_device_reference(self, direction: str):
         device_id = (
@@ -525,6 +805,8 @@ class TapeMachine(toga.App):
         return device.reference if device else None
 
     def _enter_project(self, project: AudioProject) -> None:
+        self.settings_window.window.hide()
+        self._remember_recent_file(project.path)
         self.session_audio_settings = self.audio_service.current_settings
         self.project = project
         self.project_audio_error = self._resolve_project_audio()
@@ -1046,8 +1328,22 @@ class TapeMachine(toga.App):
         self.main_window.title = self.formal_name
         self._update_audio_summary()
 
+    def _save_window_positions(self) -> None:
+        try:
+            main_position = self.main_window.position
+            settings_position = self.settings_window.window.position
+        except (AttributeError, RuntimeError) as exc:
+            print(f"Unable to read window positions: {exc}", file=sys.stderr)
+            return
+        self.app_config = self.app_config.with_window_positions(
+            WindowPosition(main_position.x, main_position.y),
+            WindowPosition(settings_position.x, settings_position.y),
+        )
+        self._persist_noncritical_config()
+
     async def on_exit(self) -> bool:
         if self.project is None:
+            self._save_window_positions()
             return True
         if self.transport_starting or self.transport_stopping:
             return False
@@ -1070,6 +1366,7 @@ class TapeMachine(toga.App):
             await self._show_project_error(f"Unable to close project: {exc}")
             return False
         self.audio_engine.stop()
+        self._save_window_positions()
         return True
 
     async def _show_project_error(self, message: str) -> None:
@@ -1127,12 +1424,15 @@ class TapeMachine(toga.App):
         routing_complete = any(
             channel is not None for channel in routing
         ) and any(channel is not None for channel in bus_outputs)
-        parts = [device_summary, sample_rate_summary]
-        if not routing_complete:
-            parts.append("Routing incomplete")
-        if self.project is not None and self.audio_engine_error is not None:
-            parts.append("Audio unavailable")
-        self.status_line_label.text = "  •  ".join(parts)
+        self.status_line_label.text = (
+            f"{device_summary}  •  {sample_rate_summary}"
+        )
+        self._set_routing_status_link_visible(not routing_complete)
+        self.status_line_suffix_label.text = (
+            "  •  Audio unavailable"
+            if self.project is not None and self.audio_engine_error is not None
+            else ""
+        )
 
 
 def main() -> TapeMachine:

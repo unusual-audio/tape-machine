@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Protocol
 
 import sounddevice
@@ -10,9 +11,27 @@ import sounddevice
 
 SAMPLE_RATES = (44_100, 48_000, 88_200, 96_000, 176_400, 192_000)
 PROJECT_TRACK_COUNT = 8
-UNASSIGNED_TRACK_INPUTS: tuple[int | None, ...] = (None,) * PROJECT_TRACK_COUNT
 STEREO_BUS_CHANNEL_COUNT = 2
 UNASSIGNED_BUS_OUTPUTS: tuple[int | None, ...] = (None,) * STEREO_BUS_CHANNEL_COUNT
+
+
+class StereoBusInput(StrEnum):
+    """Virtual input sources exposing the rendered stereo bus."""
+
+    LEFT = "stereo_bus_l"
+    RIGHT = "stereo_bus_r"
+
+
+type TrackInputRoute = int | StereoBusInput | None
+
+UNASSIGNED_TRACK_INPUTS: tuple[TrackInputRoute, ...] = (
+    None,
+) * PROJECT_TRACK_COUNT
+
+
+def is_physical_input(route: TrackInputRoute) -> bool:
+    """Return whether a route identifies a device input channel."""
+    return isinstance(route, int) and not isinstance(route, bool)
 
 
 class AudioConfigurationError(RuntimeError):
@@ -78,13 +97,17 @@ class AudioSettings:
     input_device_id: int
     output_device_id: int
     sample_rate: int
-    track_inputs: tuple[int | None, ...] = UNASSIGNED_TRACK_INPUTS
+    track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS
     bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
 
     @property
     def required_input_channels(self) -> int:
         """Number of leading device channels needed to satisfy the routing."""
-        assigned = [channel for channel in self.track_inputs if channel is not None]
+        assigned = [
+            channel
+            for channel in self.track_inputs
+            if is_physical_input(channel)
+        ]
         return max(assigned, default=-1) + 1
 
     @property
@@ -170,7 +193,7 @@ class AudioDeviceService:
         self,
         input_device_id: int,
         output_device_id: int,
-        track_inputs: tuple[int | None, ...] = UNASSIGNED_TRACK_INPUTS,
+        track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS,
         bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS,
     ) -> tuple[int, ...]:
         """Return standard rates accepted by both selected devices."""
@@ -385,7 +408,7 @@ class AudioDeviceService:
         preferred: AudioSettings | None,
         input_device_id: int,
         max_input_channels: int,
-    ) -> tuple[int | None, ...]:
+    ) -> tuple[TrackInputRoute, ...]:
         if (
             preferred is None
             or len(preferred.track_inputs) != PROJECT_TRACK_COUNT
@@ -394,16 +417,20 @@ class AudioDeviceService:
 
         return tuple(
             channel
-            if isinstance(channel, int)
-            and not isinstance(channel, bool)
+            if isinstance(channel, StereoBusInput)
+            or is_physical_input(channel)
             and channel >= 0
             else None
             for channel in preferred.track_inputs
         )
 
     @staticmethod
-    def _required_input_channels(track_inputs: tuple[int | None, ...]) -> int:
-        assigned = [channel for channel in track_inputs if channel is not None]
+    def _required_input_channels(
+        track_inputs: tuple[TrackInputRoute, ...],
+    ) -> int:
+        assigned = [
+            channel for channel in track_inputs if is_physical_input(channel)
+        ]
         return max(assigned, default=-1) + 1
 
     @staticmethod
@@ -440,12 +467,12 @@ class AudioDeviceService:
 
     @staticmethod
     def _available_input_channels(
-        track_inputs: tuple[int | None, ...], max_input_channels: int
+        track_inputs: tuple[TrackInputRoute, ...], max_input_channels: int
     ) -> int:
         assigned = [
             channel
             for channel in track_inputs
-            if channel is not None and channel < max_input_channels
+            if is_physical_input(channel) and channel < max_input_channels
         ]
         return max(assigned, default=-1) + 1
 
@@ -462,7 +489,7 @@ class AudioDeviceService:
 
     @staticmethod
     def _validate_track_inputs(
-        track_inputs: tuple[int | None, ...], input_device: AudioDevice
+        track_inputs: tuple[TrackInputRoute, ...], input_device: AudioDevice
     ) -> None:
         if len(track_inputs) != PROJECT_TRACK_COUNT:
             raise AudioConfigurationError(
@@ -470,11 +497,10 @@ class AudioDeviceService:
             )
 
         for track_index, channel in enumerate(track_inputs):
-            if channel is None:
+            if channel is None or isinstance(channel, StereoBusInput):
                 continue
             if (
-                not isinstance(channel, int)
-                or isinstance(channel, bool)
+                not is_physical_input(channel)
                 or channel < 0
             ):
                 raise AudioConfigurationError(

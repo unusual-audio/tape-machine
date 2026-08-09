@@ -6,6 +6,7 @@ from time import sleep
 import numpy as np
 import pytest
 
+from tape_machine.audio import StereoBusInput
 from tape_machine.project import AudioProject, ProjectMetadata
 from tape_machine.transport import (
     SHUTTLE_GAIN,
@@ -242,6 +243,44 @@ def test_recording_replaces_only_armed_tracks_and_duplicates_inputs(
     assert recorded[:, 2] == pytest.approx(input_audio[:, 0], abs=1e-6)
     assert not recorded[:, 3].any()
     assert recorded[:, 4:] == pytest.approx(original[:, 4:], abs=1e-6)
+    project.close()
+
+
+def test_stereo_bus_inputs_record_like_ordinary_sources(
+    tmp_path: Path,
+) -> None:
+    original = np.full((4, 8), 0.1, dtype=np.float32)
+    project = project_with_audio(tmp_path, original)
+    transport = TransportController(project)
+    routes = (
+        StereoBusInput.LEFT,
+        StereoBusInput.RIGHT,
+    ) + (None,) * 6
+    armed = (True, True) + (False,) * 6
+    stereo_bus = np.column_stack(
+        (
+            np.full(4, 1.25, np.float32),
+            np.full(4, -1.25, np.float32),
+        )
+    )
+    transport.toggle_record()
+
+    assert transport.play(routes, armed) is True
+    playback, capture_context = transport.prepare_audio(4, None)
+    assert capture_context is not None
+    transport.submit_capture(
+        capture_context,
+        np.zeros((4, 1), dtype=np.float32),
+        stereo_bus,
+    )
+    transport.stop()
+    recorded = project.read_audio_block(0, 4)
+
+    assert not playback[:, :2].any()
+    assert playback[:, 2:] == pytest.approx(original[:, 2:], abs=1e-6)
+    assert recorded[:, 0] == pytest.approx([1.0] * 4, abs=1e-6)
+    assert recorded[:, 1] == pytest.approx([-1.0] * 4, abs=1e-6)
+    assert recorded[:, 2:] == pytest.approx(original[:, 2:], abs=1e-6)
     project.close()
 
 

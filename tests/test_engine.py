@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import sqrt
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 
-from tape_machine.audio import AudioDevice, AudioSettings
+from tape_machine.audio import (
+    AudioDevice,
+    AudioSettings,
+    StereoBusInput,
+    TrackInputRoute,
+)
 from tape_machine.engine import (
     AudioEngine,
     AudioEngineError,
@@ -19,6 +25,8 @@ from tape_machine.engine import (
     stream_channel_counts,
 )
 from tape_machine.mixer import MIN_LEVEL_DB, MixerState
+from tape_machine.project import AudioProject, ProjectMetadata
+from tape_machine.transport import TransportController
 
 
 def device(
@@ -36,7 +44,7 @@ def device(
 
 def settings(
     *,
-    track_inputs: tuple[int | None, ...] = (
+    track_inputs: tuple[TrackInputRoute, ...] = (
         0,
         None,
         None,
@@ -285,12 +293,20 @@ def test_callback_renders_current_matrix_and_clips_final_output() -> None:
 
 def test_callback_routes_project_playback_through_the_mixer() -> None:
     class FakeTransport:
-        def process_audio(
-            self, indata: np.ndarray, frames: int, status: object
-        ) -> np.ndarray:
+        def prepare_audio(
+            self, frames: int, status: object
+        ) -> tuple[np.ndarray, None]:
             playback = np.zeros((frames, 8), dtype=np.float32)
             playback[:, 0] = 0.25
-            return playback
+            return playback, None
+
+        def submit_capture(
+            self,
+            context: object,
+            input_data: np.ndarray,
+            stereo_bus: np.ndarray,
+        ) -> None:
+            raise AssertionError("playback did not request capture")
 
     backend = FakeBackend()
     engine = AudioEngine(backend)
@@ -306,6 +322,119 @@ def test_callback_routes_project_playback_through_the_mixer() -> None:
 
     assert outdata[:, 0] == pytest.approx([0.25, 0.25])
     assert not outdata[:, 1].any()
+
+
+def test_callback_submits_actual_bus_even_without_hardware_outputs() -> None:
+    capture_token = object()
+
+    class CapturingTransport:
+        def __init__(self) -> None:
+            self.captures: list[tuple[np.ndarray, np.ndarray]] = []
+
+        def prepare_audio(
+            self, frames: int, status: object
+        ) -> tuple[np.ndarray, object]:
+            playback = np.zeros((frames, 8), dtype=np.float32)
+            playback[:, 3] = 0.25
+            return playback, capture_token
+
+        def submit_capture(
+            self,
+            context: object,
+            input_data: np.ndarray,
+            stereo_bus: np.ndarray,
+        ) -> None:
+            assert context is capture_token
+            self.captures.append((input_data.copy(), stereo_bus.copy()))
+
+    routes = (
+        0,
+        StereoBusInput.LEFT,
+        StereoBusInput.RIGHT,
+    ) + (None,) * 5
+    audio_settings = settings(track_inputs=routes, bus_outputs=(None, None))
+    state = MixerState.from_track_inputs(routes)
+    state.tracks[0].input_monitoring = True
+    state.tracks[0].pan = -1
+    state.tracks[0].level_db = -6
+    state.tracks[3].pan = 1
+    state.bus_level_db = -6
+    transport = CapturingTransport()
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.set_transport(transport)
+    engine.start(
+        audio_settings,
+        state,
+        device(inputs=1, index=1),
+        device(outputs=1, index=2),
+    )
+    callback = backend.streams[0].kwargs["callback"]
+    indata = np.full((2, 1), 0.5, dtype=np.float32)
+    outdata = np.ones((2, 1), dtype=np.float32)
+
+    callback(indata, outdata, 2, None, None)
+
+    assert not outdata.any()
+    assert len(transport.captures) == 1
+    captured_input, captured_bus = transport.captures[0]
+    assert captured_input == pytest.approx(indata)
+    assert captured_bus[:, 0] == pytest.approx(
+        [0.5 * db_to_gain(-6) ** 2] * 2
+    )
+    assert captured_bus[:, 1] == pytest.approx(
+        [0.25 * db_to_gain(-6)] * 2
+    )
+
+
+def test_engine_and_transport_record_stereo_bus_loopback_end_to_end(
+    tmp_path: Path,
+) -> None:
+    project = AudioProject.create(
+        tmp_path / "loopback.wav", 48_000, ProjectMetadata()
+    )
+    original = np.zeros((4, 8), dtype=np.float32)
+    original[:, 0] = 0.25
+    original[:, 1] = -0.25
+    project.audio_file.write(original)
+    project.flush_audio()
+    routes = (None,) * 6 + (
+        StereoBusInput.LEFT,
+        StereoBusInput.RIGHT,
+    )
+    armed = (False,) * 6 + (True, True)
+    state = MixerState.from_track_inputs(routes)
+    state.tracks[0].pan = -1
+    state.tracks[1].pan = 1
+    transport = TransportController(project)
+    transport.toggle_record()
+    assert transport.play(routes, armed) is True
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.set_transport(transport)
+    engine.start(
+        settings(track_inputs=routes, bus_outputs=(None, None)),
+        state,
+        device(inputs=1, index=1),
+        device(outputs=1, index=2),
+    )
+    callback = backend.streams[0].kwargs["callback"]
+
+    callback(
+        np.zeros((4, 1), dtype=np.float32),
+        np.zeros((4, 1), dtype=np.float32),
+        4,
+        None,
+        None,
+    )
+    transport.stop()
+    engine.stop()
+    recorded = project.read_audio_block(0, 4)
+
+    assert recorded[:, 6] == pytest.approx([0.25] * 4, abs=1e-6)
+    assert recorded[:, 7] == pytest.approx([-0.25] * 4, abs=1e-6)
+    assert recorded[:, :6] == pytest.approx(original[:, :6], abs=1e-6)
+    project.close()
 
 
 def test_callback_accepts_raw_stream_buffers() -> None:

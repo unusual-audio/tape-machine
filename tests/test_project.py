@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import soundfile
 
-from tape_machine.audio import DeviceReference
+from tape_machine.audio import DeviceReference, StereoBusInput
 from tape_machine.project import (
     PROJECT_COMMENT_PREFIX,
     AudioProject,
@@ -123,8 +123,37 @@ def test_schema_one_metadata_loads_with_default_mix() -> None:
     upgraded_payload = json.loads(
         loaded.to_comment()[len(PROJECT_COMMENT_PREFIX) :]
     )
-    assert upgraded_payload["schema_version"] == 2
+    assert upgraded_payload["schema_version"] == 3
     assert "mix" in upgraded_payload
+
+
+def test_stereo_bus_inputs_round_trip_as_schema_three_strings() -> None:
+    metadata = project_metadata().with_audio(
+        DeviceReference("Studio Input", "Core Audio"),
+        DeviceReference("Studio Output", "Core Audio"),
+        (StereoBusInput.LEFT, StereoBusInput.RIGHT) + (None,) * 6,
+        (0, 1),
+    )
+
+    comment = metadata.to_comment()
+    payload = json.loads(comment[len(PROJECT_COMMENT_PREFIX) :])
+
+    assert payload["schema_version"] == 3
+    assert payload["track_inputs"][:2] == ["stereo_bus_l", "stereo_bus_r"]
+    assert ProjectMetadata.from_comment(comment) == metadata
+
+
+def test_schema_two_numeric_routes_still_load() -> None:
+    payload = json.loads(
+        project_metadata().to_comment()[len(PROJECT_COMMENT_PREFIX) :]
+    )
+    payload["schema_version"] = 2
+
+    loaded = ProjectMetadata.from_comment(
+        PROJECT_COMMENT_PREFIX + json.dumps(payload)
+    )
+
+    assert loaded == project_metadata()
 
 
 @pytest.mark.parametrize(

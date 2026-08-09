@@ -16,6 +16,7 @@ from tape_machine.audio import (
     DeviceReference,
     AudioDeviceService,
     AudioSettings,
+    StereoBusInput,
 )
 
 
@@ -299,6 +300,39 @@ def test_unassigned_routing_skips_input_capability_probe(
         for kind, kwargs in backend.check_calls
         if kind == "output"
     )
+
+
+def test_stereo_bus_inputs_do_not_request_physical_input_channels(
+    backend: FakeSoundDevice,
+) -> None:
+    service = AudioDeviceService(backend)
+    service.refresh_devices()
+    routes = (
+        StereoBusInput.LEFT,
+        StereoBusInput.RIGHT,
+    ) + (None,) * 6
+    settings = AudioSettings(0, 1, 48_000, routes, (0, 1))
+
+    service.validate(settings)
+
+    assert settings.required_input_channels == 0
+    assert {kind for kind, kwargs in backend.check_calls} == {"output"}
+
+
+def test_suggestion_preserves_stereo_bus_input_routes(
+    backend: FakeSoundDevice,
+) -> None:
+    service = AudioDeviceService(backend)
+    service.refresh_devices()
+    preferred = AudioSettings(
+        0,
+        1,
+        48_000,
+        (StereoBusInput.LEFT,) + (None,) * 7,
+        (0, 1),
+    )
+
+    assert service.suggest_settings(preferred) == preferred
 
 
 def test_output_probe_reaches_highest_mapped_channel(

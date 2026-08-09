@@ -2,6 +2,7 @@
 
 import pytest
 
+from tape_machine.audio import StereoBusInput
 from tape_machine.mixer import (
     MAX_LEVEL_DB,
     MIN_LEVEL_DB,
@@ -129,6 +130,28 @@ def test_portable_channel_number_counts_as_assigned() -> None:
 
     assert state.tracks[0].input_assigned is True
     assert state.toggle(0, "record_enabled") is True
+
+
+def test_stereo_bus_route_can_record_but_cannot_input_monitor() -> None:
+    saved_track = TrackMixMetadata(
+        record_enabled=True, input_monitoring=True
+    )
+    state = MixerState.from_metadata(
+        (StereoBusInput.LEFT,) + (None,) * 7,
+        MixerMetadata(
+            tracks=(saved_track,) + (TrackMixMetadata(),) * 7
+        ),
+    )
+    track = state.tracks[0]
+
+    assert track.input_assigned is True
+    assert track.input_monitorable is False
+    assert track.record_enabled is True
+    assert track.input_monitoring is False
+    assert state.toggle(0, "record_enabled") is False
+    assert state.toggle(0, "record_enabled") is True
+    assert state.toggle(0, "input_monitoring") is False
+    assert state.to_metadata().tracks[0].input_monitoring is False
 
 
 def test_multiple_tracks_can_solo_independently() -> None:

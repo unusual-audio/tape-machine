@@ -1,12 +1,19 @@
 """Tests for the main-window audio summary."""
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tape_machine.app import ShuttleButton, TapeMachine
-from tape_machine.audio import AudioDevice, AudioSettings, DeviceReference
+from tape_machine.app import ShuttleButton, TapeMachine, _fit_window_position
+from tape_machine.audio import (
+    AudioDevice,
+    AudioSettings,
+    DeviceReference,
+    StereoBusInput,
+)
+from tape_machine.config import AppConfig, StoredAudioSettings, WindowPosition
 from tape_machine.engine import AudioEngineError
 from tape_machine.mixer import MixerState
 from tape_machine.project import ProjectMetadata
@@ -98,11 +105,18 @@ class FakeProject:
 
 
 def summary_app(settings: AudioSettings | None) -> SimpleNamespace:
-    return SimpleNamespace(
+    app = SimpleNamespace(
         audio_service=FakeService(settings),
         status_line_label=SimpleNamespace(text=""),
+        routing_status_link_visible=False,
+        status_line_suffix_label=SimpleNamespace(text=""),
         project=None,
+        audio_engine_error=None,
     )
+    app._set_routing_status_link_visible = lambda visible: setattr(
+        app, "routing_status_link_visible", visible
+    )
+    return app
 
 
 def test_status_line_marks_incomplete_routing() -> None:
@@ -110,9 +124,8 @@ def test_status_line_marks_incomplete_routing() -> None:
 
     TapeMachine._update_audio_summary(app)
 
-    assert app.status_line_label.text == (
-        "Interface  •  48 kHz  •  Routing incomplete"
-    )
+    assert app.status_line_label.text == "Interface  •  48 kHz"
+    assert app.routing_status_link_visible is True
 
 
 def test_status_line_omits_message_when_all_routing_is_complete() -> None:
@@ -123,6 +136,7 @@ def test_status_line_omits_message_when_all_routing_is_complete() -> None:
     TapeMachine._update_audio_summary(app)
 
     assert app.status_line_label.text == "Interface  •  48 kHz"
+    assert app.routing_status_link_visible is False
 
 
 def test_status_line_accepts_partial_input_and_output_routing() -> None:
@@ -139,6 +153,24 @@ def test_status_line_accepts_partial_input_and_output_routing() -> None:
     TapeMachine._update_audio_summary(app)
 
     assert app.status_line_label.text == "Interface  •  48 kHz"
+    assert app.routing_status_link_visible is False
+
+
+def test_status_line_counts_stereo_bus_loopback_as_an_input_route() -> None:
+    app = summary_app(
+        AudioSettings(
+            1,
+            1,
+            48_000,
+            (StereoBusInput.LEFT,) + (None,) * 7,
+            (0, 1),
+        )
+    )
+
+    TapeMachine._update_audio_summary(app)
+
+    assert app.status_line_label.text == "Interface  •  48 kHz"
+    assert app.routing_status_link_visible is False
 
 
 def test_status_line_marks_unrouted_stereo_bus_as_incomplete() -> None:
@@ -153,9 +185,8 @@ def test_status_line_marks_unrouted_stereo_bus_as_incomplete() -> None:
 
     TapeMachine._update_audio_summary(app)
 
-    assert app.status_line_label.text == (
-        "Interface  •  48 kHz  •  Routing incomplete"
-    )
+    assert app.status_line_label.text == "Interface  •  48 kHz"
+    assert app.routing_status_link_visible is True
 
 
 def test_status_line_separates_different_device_names() -> None:
@@ -181,8 +212,9 @@ def test_status_line_handles_missing_audio_configuration() -> None:
     TapeMachine._update_audio_summary(app)
 
     assert app.status_line_label.text == (
-        "No audio device  •  Sample rate unavailable  •  Routing incomplete"
+        "No audio device  •  Sample rate unavailable"
     )
+    assert app.routing_status_link_visible is True
 
 
 def test_status_line_accepts_mappings_beyond_available_device_channels() -> None:
@@ -199,6 +231,7 @@ def test_status_line_accepts_mappings_beyond_available_device_channels() -> None
     TapeMachine._update_audio_summary(app)
 
     assert app.status_line_label.text == "Interface  •  48 kHz"
+    assert app.routing_status_link_visible is False
 
 
 def test_status_line_marks_project_audio_engine_failure() -> None:
@@ -210,9 +243,60 @@ def test_status_line_marks_project_audio_engine_failure() -> None:
 
     TapeMachine._update_audio_summary(app)
 
-    assert app.status_line_label.text == (
-        "Interface  •  48 kHz  •  Audio unavailable"
+    assert app.status_line_label.text == "Interface  •  48 kHz"
+    assert app.routing_status_link_visible is False
+    assert app.status_line_suffix_label.text == "  •  Audio unavailable"
+
+
+def test_status_link_hides_after_entering_a_fully_routed_project() -> None:
+    app = summary_app(AudioSettings(1, 1, 48_000))
+    TapeMachine._update_audio_summary(app)
+    assert app.routing_status_link_visible is True
+
+    app.project = SimpleNamespace(
+        sample_rate=48_000,
+        metadata=ProjectMetadata(
+            track_inputs=tuple(range(8)),
+            bus_outputs=(0, 1),
+        ),
     )
+    app.audio_service.current_settings = AudioSettings(
+        1, 1, 48_000, tuple(range(8)), (0, 1)
+    )
+
+    TapeMachine._update_audio_summary(app)
+
+    assert app.routing_status_link_visible is False
+
+
+def test_routing_status_link_opens_audio_settings() -> None:
+    calls: list[None] = []
+    app = SimpleNamespace(preferences=lambda: calls.append(None))
+
+    TapeMachine._open_routing_settings(app)
+
+    assert calls == [None]
+
+
+def test_routing_status_link_is_inserted_and_removed_for_state_changes() -> None:
+    link = object()
+    inserted: list[tuple[int, object]] = []
+    removed: list[object] = []
+    app = SimpleNamespace(
+        _routing_status_link_visible=False,
+        routing_status_link_group=link,
+        status_line_content=SimpleNamespace(
+            insert=lambda index, child: inserted.append((index, child)),
+            remove=removed.append,
+        ),
+    )
+
+    TapeMachine._set_routing_status_link_visible(app, True)
+    TapeMachine._set_routing_status_link_visible(app, True)
+    TapeMachine._set_routing_status_link_visible(app, False)
+
+    assert inserted == [(1, link)]
+    assert removed == [link]
 
 
 def test_mixer_change_rebuilds_running_engine_matrix() -> None:
@@ -410,6 +494,7 @@ def test_failed_candidate_stream_keeps_project_metadata_and_old_settings() -> No
 
 
 def test_project_commands_follow_open_project_state() -> None:
+    recent_commands = [SimpleNamespace(enabled=False) for _ in range(2)]
     app = SimpleNamespace(
         project=None,
         new_project_command=SimpleNamespace(enabled=False),
@@ -421,6 +506,7 @@ def test_project_commands_follow_open_project_state() -> None:
         transport_starting=False,
         transport_stopping=False,
         momentary_shuttle_task=None,
+        recent_file_commands=recent_commands,
     )
 
     TapeMachine._update_command_state(app)
@@ -430,6 +516,7 @@ def test_project_commands_follow_open_project_state() -> None:
     assert app.save_project_command.enabled is False
     assert app.close_project_command.enabled is False
     assert app.settings_command.enabled is True
+    assert all(command.enabled is True for command in recent_commands)
 
     app.project = object()
     TapeMachine._update_command_state(app)
@@ -438,6 +525,7 @@ def test_project_commands_follow_open_project_state() -> None:
     assert app.open_project_command.enabled is False
     assert app.save_project_command.enabled is True
     assert app.close_project_command.enabled is True
+    assert all(command.enabled is False for command in recent_commands)
 
     app.transport = SimpleNamespace(running=True)
     TapeMachine._update_command_state(app)
@@ -445,6 +533,98 @@ def test_project_commands_follow_open_project_state() -> None:
     assert app.save_project_command.enabled is False
     assert app.close_project_command.enabled is False
     assert app.settings_command.enabled is False
+
+
+def test_window_position_is_clamped_to_an_attached_screen() -> None:
+    screens = [
+        SimpleNamespace(
+            origin=SimpleNamespace(x=0, y=0),
+            size=SimpleNamespace(width=1920, height=1080),
+        ),
+        SimpleNamespace(
+            origin=SimpleNamespace(x=-1280, y=0),
+            size=SimpleNamespace(width=1280, height=1024),
+        ),
+    ]
+
+    assert _fit_window_position(WindowPosition(-100, 900), (900, 640), screens) == (
+        -900,
+        384,
+    )
+    assert _fit_window_position(WindowPosition(3000, 2000), (912, 560), screens) == (
+        1008,
+        520,
+    )
+    assert _fit_window_position(None, (912, 560), screens) is None
+
+
+def test_audio_default_persistence_stores_all_selected_settings() -> None:
+    current = AudioSettings(1, 1, 48_000)
+    candidate = AudioSettings(1, 1, 96_000, tuple(range(8)), (0, 1))
+    service = FakeService(current)
+    saved: list[AppConfig] = []
+    app = object.__new__(TapeMachine)
+    app.audio_service = service
+    app.app_config = AppConfig()
+    app.config_store = SimpleNamespace(save=saved.append)
+
+    TapeMachine._save_audio_settings_as_default(app, candidate)
+
+    assert service.current_settings is current
+    assert saved == [app.app_config]
+    assert app.app_config.default_audio_settings == StoredAudioSettings(
+        input_device=service._input_device.reference,
+        output_device=service._output_device.reference,
+        sample_rate=96_000,
+        track_inputs=tuple(range(8)),
+        bus_outputs=(0, 1),
+    )
+
+
+def test_recent_files_are_persisted_and_menu_is_rebuilt(tmp_path: Path) -> None:
+    saved: list[AppConfig] = []
+    rebuilds: list[None] = []
+    app = object.__new__(TapeMachine)
+    app.app_config = AppConfig()
+    app.config_store = SimpleNamespace(save=saved.append)
+    app._rebuild_recent_files_menu = lambda: rebuilds.append(None)
+    project_path = tmp_path / "project.wav"
+
+    TapeMachine._remember_recent_file(app, project_path)
+    TapeMachine._remember_recent_file(app, project_path)
+    TapeMachine.clear_recent_files(app)
+
+    assert saved[0].recent_files == (project_path.resolve(),)
+    assert saved[-1].recent_files == ()
+    assert len(saved) == 2
+    assert len(rebuilds) == 2
+
+
+def test_window_positions_merge_with_existing_config() -> None:
+    stored = StoredAudioSettings(
+        DeviceReference("Input", "Core Audio"),
+        DeviceReference("Output", "Core Audio"),
+        48_000,
+        (None,) * 8,
+        (0, 1),
+    )
+    saved: list[AppConfig] = []
+    app = object.__new__(TapeMachine)
+    app.app_config = AppConfig(default_audio_settings=stored)
+    app.config_store = SimpleNamespace(save=saved.append)
+    app._main_window = SimpleNamespace(
+        position=SimpleNamespace(x=120, y=80)
+    )
+    app.settings_window = SimpleNamespace(
+        window=SimpleNamespace(position=SimpleNamespace(x=-700, y=140))
+    )
+
+    TapeMachine._save_window_positions(app)
+
+    assert app.app_config.default_audio_settings is stored
+    assert app.app_config.main_window_position == WindowPosition(120, 80)
+    assert app.app_config.audio_settings_window_position == WindowPosition(-700, 140)
+    assert saved == [app.app_config]
 
 
 def test_transport_controls_show_toggle_stop_and_time_state() -> None:

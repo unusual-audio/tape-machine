@@ -9,7 +9,11 @@ from typing import Callable
 import toga
 from toga.style.pack import CENTER, COLUMN, ROW
 
-from tape_machine.audio import PROJECT_TRACK_COUNT
+from tape_machine.audio import (
+    PROJECT_TRACK_COUNT,
+    TrackInputRoute,
+    is_physical_input,
+)
 from tape_machine.project import (
     MIX_MAX_LEVEL_DB,
     MIX_MIN_LEVEL_DB,
@@ -71,6 +75,7 @@ class TrackMixerState:
     """Live state for one project track strip."""
 
     input_assigned: bool = False
+    input_monitorable: bool = False
     level_db: float = UNITY_LEVEL_DB
     pan: float = 0.0
     record_enabled: bool = False
@@ -95,14 +100,14 @@ class MixerState:
 
     @classmethod
     def from_track_inputs(
-        cls, track_inputs: tuple[int | None, ...]
+        cls, track_inputs: tuple[TrackInputRoute, ...]
     ) -> MixerState:
         return cls.from_metadata(track_inputs, MixerMetadata())
 
     @classmethod
     def from_metadata(
         cls,
-        track_inputs: tuple[int | None, ...],
+        track_inputs: tuple[TrackInputRoute, ...],
         mix: MixerMetadata,
     ) -> MixerState:
         """Restore persisted controls and derive input availability from routes."""
@@ -113,16 +118,18 @@ class MixerState:
         tracks = []
         for channel, saved in zip(track_inputs, mix.tracks, strict=True):
             input_assigned = channel is not None
+            input_monitorable = is_physical_input(channel)
             tracks.append(
                 TrackMixerState(
                     input_assigned=input_assigned,
+                    input_monitorable=input_monitorable,
                     level_db=saved.level_db,
                     pan=saved.pan,
                     record_enabled=(
                         saved.record_enabled if input_assigned else False
                     ),
                     input_monitoring=(
-                        saved.input_monitoring if input_assigned else False
+                        saved.input_monitoring if input_monitorable else False
                     ),
                     muted=saved.muted,
                     soloed=saved.soloed,
@@ -131,7 +138,7 @@ class MixerState:
         return cls(tracks=tracks, bus_level_db=mix.bus_level_db)
 
     def to_metadata(
-        self, track_inputs: tuple[int | None, ...] | None = None
+        self, track_inputs: tuple[TrackInputRoute, ...] | None = None
     ) -> MixerMetadata:
         """Snapshot controls, normalizing input-only states for absent routes."""
         if track_inputs is not None and len(track_inputs) != PROJECT_TRACK_COUNT:
@@ -145,6 +152,11 @@ class MixerState:
                 if track_inputs is None
                 else track_inputs[index] is not None
             )
+            input_monitorable = (
+                track.input_monitorable
+                if track_inputs is None
+                else is_physical_input(track_inputs[index])
+            )
             saved_tracks.append(
                 TrackMixMetadata(
                     level_db=track.level_db,
@@ -153,7 +165,7 @@ class MixerState:
                         track.record_enabled if input_assigned else False
                     ),
                     input_monitoring=(
-                        track.input_monitoring if input_assigned else False
+                        track.input_monitoring if input_monitorable else False
                     ),
                     muted=track.muted,
                     soloed=track.soloed,
@@ -164,7 +176,7 @@ class MixerState:
         )
 
     def update_input_routes(
-        self, track_inputs: tuple[int | None, ...]
+        self, track_inputs: tuple[TrackInputRoute, ...]
     ) -> None:
         """Update input availability and clear invalid input-only states."""
         if len(track_inputs) != PROJECT_TRACK_COUNT:
@@ -173,8 +185,10 @@ class MixerState:
             )
         for track, channel in zip(self.tracks, track_inputs, strict=True):
             track.input_assigned = channel is not None
+            track.input_monitorable = is_physical_input(channel)
             if not track.input_assigned:
                 track.record_enabled = False
+            if not track.input_monitorable:
                 track.input_monitoring = False
         self._notify()
 
@@ -200,9 +214,9 @@ class MixerState:
         if control not in _CONTROL_COLORS:
             raise ValueError(f"Unknown mixer control {control!r}.")
         track = self.tracks[track_index]
-        if control in {"record_enabled", "input_monitoring"} and not (
-            track.input_assigned
-        ):
+        if control == "record_enabled" and not track.input_assigned:
+            return False
+        if control == "input_monitoring" and not track.input_monitorable:
             return False
         value = not getattr(track, control)
         setattr(track, control, value)
@@ -485,7 +499,7 @@ class TrackStrip:
                 )
             elif control == "input_monitoring":
                 button.enabled = (
-                    self.state.input_assigned and self.monitoring_available
+                    self.state.input_monitorable and self.monitoring_available
                 )
             else:
                 button.enabled = True
@@ -528,7 +542,7 @@ class MixerView:
 
     def __init__(
         self,
-        track_inputs: tuple[int | None, ...],
+        track_inputs: tuple[TrackInputRoute, ...],
         state: MixerState | None = None,
     ) -> None:
         self.state = state or MixerState.from_track_inputs(track_inputs)
@@ -562,7 +576,7 @@ class MixerView:
         )
 
     def update_track_routes(
-        self, track_inputs: tuple[int | None, ...]
+        self, track_inputs: tuple[TrackInputRoute, ...]
     ) -> None:
         self.state.update_input_routes(track_inputs)
         for strip in self.track_strips:
