@@ -8,6 +8,7 @@ import pytest
 import soundfile
 
 from tape_machine.audio import (
+    AUDIO_BUFFER_SIZES,
     PROJECT_TRACK_COUNT,
     SAMPLE_RATES,
     UNASSIGNED_BUS_OUTPUTS,
@@ -164,10 +165,12 @@ def test_suggestion_preserves_supported_preference(backend: FakeSoundDevice) -> 
     track_inputs = (3, 3, None, None, None, None, None, None)
 
     suggested = service.suggest_settings(
-        AudioSettings(2, 2, 96_000, track_inputs, (2, 3))
+        AudioSettings(2, 2, 96_000, track_inputs, (2, 3), 256)
     )
 
-    assert suggested == AudioSettings(2, 2, 96_000, track_inputs, (2, 3))
+    assert suggested == AudioSettings(
+        2, 2, 96_000, track_inputs, (2, 3), 256
+    )
 
 
 def test_suggestion_preserves_routing_when_input_device_changes(
@@ -264,6 +267,31 @@ def test_project_sample_rate_is_not_limited_to_studio_rate_list(
     service.refresh_devices()
 
     service.validate(AudioSettings(0, 1, 32_000))
+
+
+@pytest.mark.parametrize("buffer_size", AUDIO_BUFFER_SIZES)
+def test_standard_audio_buffer_sizes_are_valid(
+    backend: FakeSoundDevice, buffer_size: int
+) -> None:
+    service = AudioDeviceService(backend)
+    service.refresh_devices()
+
+    service.validate(
+        AudioSettings(0, 1, 48_000, buffer_size=buffer_size)
+    )
+
+
+@pytest.mark.parametrize("buffer_size", [-1, 16, 4096, True])
+def test_nonstandard_audio_buffer_sizes_are_rejected(
+    backend: FakeSoundDevice, buffer_size: int
+) -> None:
+    service = AudioDeviceService(backend)
+    service.refresh_devices()
+
+    with pytest.raises(AudioConfigurationError, match="buffer size"):
+        service.validate(
+            AudioSettings(0, 1, 48_000, buffer_size=buffer_size)
+        )
 
 
 def test_repeated_input_can_feed_multiple_tracks(backend: FakeSoundDevice) -> None:

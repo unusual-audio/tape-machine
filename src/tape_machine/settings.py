@@ -9,6 +9,7 @@ import toga
 from toga.style.pack import CENTER, COLUMN, END, ROW
 
 from tape_machine.audio import (
+    AUDIO_BUFFER_SIZES,
     PROJECT_TRACK_COUNT,
     STEREO_BUS_CHANNEL_COUNT,
     UNASSIGNED_BUS_OUTPUTS,
@@ -44,6 +45,18 @@ class SampleRateChoice:
         if self.value % 1_000 == 0:
             return f"{self.value // 1_000} kHz"
         return f"{self.value / 1_000:g} kHz"
+
+
+@dataclass(frozen=True, slots=True)
+class BufferSizeChoice:
+    """Human-readable audio callback buffer size."""
+
+    value: int
+
+    def __str__(self) -> str:
+        if self.value == 0:
+            return "Automatic"
+        return f"{self.value} samples"
 
 
 def input_source_rows(
@@ -90,6 +103,7 @@ class AudioSettingsDraft:
     sample_rate: int | None
     track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS
     bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
+    buffer_size: int = 0
 
     @classmethod
     def from_settings(cls, settings: AudioSettings | None) -> AudioSettingsDraft:
@@ -101,6 +115,7 @@ class AudioSettingsDraft:
             settings.sample_rate,
             settings.track_inputs,
             settings.bus_outputs,
+            settings.buffer_size,
         )
 
 
@@ -137,6 +152,11 @@ class AudioSettingsWindow:
             items=[], on_change=self._on_device_changed, flex=1
         )
         self.sample_rate_selection = toga.Selection(items=[], flex=1)
+        self.buffer_size_selection = toga.Selection(
+            items=[BufferSizeChoice(size) for size in AUDIO_BUFFER_SIZES],
+            flex=1,
+        )
+        self.buffer_size_selection.value = BufferSizeChoice(0)
         self.status_label = toga.Label("", margin_top=12)
         self.routing_scroll = toga.ScrollContainer(
             horizontal=False,
@@ -175,6 +195,7 @@ class AudioSettingsWindow:
                 self._setting_row("Input device", self.input_selection),
                 self._setting_row("Output device", self.output_selection),
                 self._setting_row("Sample rate", self.sample_rate_selection),
+                self._setting_row("Buffer size", self.buffer_size_selection),
                 toga.Divider(margin_top=8, margin_bottom=16),
                 self.routing_scroll,
                 self.status_label,
@@ -264,6 +285,12 @@ class AudioSettingsWindow:
             ):
                 suggested = self.service.suggest_settings()
                 loaded_draft = AudioSettingsDraft.from_settings(suggested)
+
+            self.buffer_size_selection.value = BufferSizeChoice(
+                loaded_draft.buffer_size
+                if loaded_draft.buffer_size in AUDIO_BUFFER_SIZES
+                else 0
+            )
 
             if inputs and outputs:
                 self._select_device(
@@ -372,6 +399,7 @@ class AudioSettingsWindow:
                     self.locked_sample_rate,
                     self.track_inputs,
                     self.bus_outputs,
+                    self._selected_buffer_size(),
                 )
                 compatibility_error = (
                     None
@@ -747,6 +775,10 @@ class AudioSettingsWindow:
         choice = self.sample_rate_selection.value
         return choice.value if isinstance(choice, SampleRateChoice) else None
 
+    def _selected_buffer_size(self) -> int:
+        choice = self.buffer_size_selection.value
+        return choice.value if isinstance(choice, BufferSizeChoice) else 0
+
     def _selected_settings(self) -> AudioSettings | None:
         input_choice = self.input_selection.value
         output_choice = self.output_selection.value
@@ -766,6 +798,7 @@ class AudioSettingsWindow:
             sample_rate=sample_rate,
             track_inputs=self.track_inputs,
             bus_outputs=self.bus_outputs,
+            buffer_size=self._selected_buffer_size(),
         )
 
     def _save(self, widget: toga.Widget, **kwargs: object) -> None:

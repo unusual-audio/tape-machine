@@ -278,6 +278,28 @@ def test_routing_status_link_opens_audio_settings() -> None:
     assert calls == [None]
 
 
+def test_project_preferences_preserve_project_buffer_size() -> None:
+    opened: list[tuple[object, dict[str, object]]] = []
+    metadata = ProjectMetadata(buffer_size=512)
+    app = SimpleNamespace(
+        project=SimpleNamespace(sample_rate=48_000, metadata=metadata),
+        audio_service=SimpleNamespace(
+            current_settings=AudioSettings(1, 2, 48_000, buffer_size=256)
+        ),
+        audio_engine=SimpleNamespace(running=True),
+        settings_window=SimpleNamespace(
+            open=lambda draft, **kwargs: opened.append((draft, kwargs))
+        ),
+        _project_audio_settings_applied=object(),
+    )
+
+    TapeMachine.preferences(app)
+
+    draft, kwargs = opened[0]
+    assert draft.buffer_size == 512
+    assert kwargs["locked_sample_rate"] == 48_000
+
+
 def test_routing_status_link_is_inserted_and_removed_for_state_changes() -> None:
     link = object()
     inserted: list[tuple[int, object]] = []
@@ -311,6 +333,7 @@ def test_mixer_change_rebuilds_running_engine_matrix() -> None:
         project.metadata.output_device,
         routes,
         (0, 1),
+        project.metadata.buffer_size,
     )
     app = SimpleNamespace(
         mixer_state=state,
@@ -359,6 +382,7 @@ def test_project_audio_settings_commit_after_stream_starts() -> None:
         48_000,
         (0, None, None, None, None, None, None, None),
         (0, 1),
+        256,
     )
     service = FakeService(old_settings)
     engine = FakeLifecycleEngine()
@@ -392,6 +416,7 @@ def test_project_audio_settings_commit_after_stream_starts() -> None:
     assert project.saved[0].mix.tracks[0].level_db == -8.0
     assert project.saved[0].mix.tracks[0].muted is True
     assert project.saved[0].mix.bus_level_db == -3.0
+    assert project.saved[0].buffer_size == 256
     assert service.current_settings == new_settings
     assert app.project_audio_error is None
     assert app.audio_engine_error is None
@@ -463,13 +488,7 @@ def test_saving_unchanged_project_settings_keeps_active_stream() -> None:
 
 def test_failed_candidate_stream_keeps_project_metadata_and_old_settings() -> None:
     old_settings = AudioSettings(1, 1, 48_000)
-    new_settings = AudioSettings(
-        1,
-        1,
-        48_000,
-        (0, None, None, None, None, None, None, None),
-        (0, 1),
-    )
+    new_settings = AudioSettings(1, 1, 48_000, buffer_size=256)
     service = FakeService(old_settings)
     engine = FakeLifecycleEngine(fail_start=True)
     project = FakeProject()
@@ -560,7 +579,9 @@ def test_window_position_is_clamped_to_an_attached_screen() -> None:
 
 def test_audio_default_persistence_stores_all_selected_settings() -> None:
     current = AudioSettings(1, 1, 48_000)
-    candidate = AudioSettings(1, 1, 96_000, tuple(range(8)), (0, 1))
+    candidate = AudioSettings(
+        1, 1, 96_000, tuple(range(8)), (0, 1), 512
+    )
     service = FakeService(current)
     saved: list[AppConfig] = []
     app = object.__new__(TapeMachine)
@@ -578,6 +599,7 @@ def test_audio_default_persistence_stores_all_selected_settings() -> None:
         sample_rate=96_000,
         track_inputs=tuple(range(8)),
         bus_outputs=(0, 1),
+        buffer_size=512,
     )
 
 

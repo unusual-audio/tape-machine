@@ -9,8 +9,11 @@ and multichannel project audio is stored with
 ## Audio settings
 
 Open **Tape Machine → Settings…** or press <kbd>⌘</kbd><kbd>,</kbd> to select
-independent input and output devices, choose a supported studio sample rate, and
-route input sources to eight project tracks. In addition to physical inputs, the
+independent input and output devices, choose a supported studio sample rate and
+audio buffer size, and route input sources to eight project tracks. Buffer choices
+range from 32 to 2048 samples, plus **Automatic** for the device default. Smaller
+buffers reduce monitoring latency but increase the risk of audio dropouts. In
+addition to physical inputs, the
 matrix provides **Stereo bus L** and **Stereo bus R** as ordinary loopback inputs.
 Each track accepts one input, while the same input can feed multiple tracks. The
 stereo project bus can route its left and right sides to distinct physical outputs;
@@ -22,7 +25,8 @@ does not erase them, and unavailable routes are shown as routing into the void.
 On the initial screen, **Save as Default** applies the complete dialog configuration
 to the current session and stores it as the template for the next app launch without
 closing Audio Settings. This includes both devices, the sample rate, all track-input
-routes, and both stereo-bus outputs. Project-specific Audio Settings continue to
+routes, both stereo-bus outputs, and the buffer size. Project-specific Audio
+Settings continue to
 offer only **Save** and are written to the project rather than the app default.
 
 ## Projects

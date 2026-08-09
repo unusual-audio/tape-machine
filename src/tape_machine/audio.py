@@ -10,6 +10,7 @@ import sounddevice
 
 
 SAMPLE_RATES = (44_100, 48_000, 88_200, 96_000, 176_400, 192_000)
+AUDIO_BUFFER_SIZES = (0, 32, 64, 128, 256, 512, 1024, 2048)
 PROJECT_TRACK_COUNT = 8
 STEREO_BUS_CHANNEL_COUNT = 2
 UNASSIGNED_BUS_OUTPUTS: tuple[int | None, ...] = (None,) * STEREO_BUS_CHANNEL_COUNT
@@ -99,6 +100,7 @@ class AudioSettings:
     sample_rate: int
     track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS
     bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
+    buffer_size: int = 0
 
     @property
     def required_input_channels(self) -> int:
@@ -277,12 +279,19 @@ class AudioDeviceService:
         else:
             sample_rate = rates[0]
 
+        buffer_size = (
+            preferred.buffer_size
+            if preferred and preferred.buffer_size in AUDIO_BUFFER_SIZES
+            else 0
+        )
+
         return AudioSettings(
             input_device_id,
             output_device_id,
             sample_rate,
             track_inputs,
             bus_outputs,
+            buffer_size,
         )
 
     def apply(self, settings: AudioSettings) -> None:
@@ -306,6 +315,14 @@ class AudioDeviceService:
         ):
             raise AudioConfigurationError(
                 f"{settings.sample_rate!r} is not a valid sample rate."
+            )
+        if (
+            not isinstance(settings.buffer_size, int)
+            or isinstance(settings.buffer_size, bool)
+            or settings.buffer_size not in AUDIO_BUFFER_SIZES
+        ):
+            raise AudioConfigurationError(
+                f"{settings.buffer_size!r} is not a supported audio buffer size."
             )
 
         self._validate_track_inputs(settings.track_inputs, input_device)

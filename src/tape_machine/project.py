@@ -14,6 +14,7 @@ import numpy as np
 import soundfile
 
 from tape_machine.audio import (
+    AUDIO_BUFFER_SIZES,
     PROJECT_TRACK_COUNT,
     STEREO_BUS_CHANNEL_COUNT,
     UNASSIGNED_BUS_OUTPUTS,
@@ -26,7 +27,7 @@ from tape_machine.audio import (
 
 
 PROJECT_APPLICATION_ID = "pkg.unusualaudio.tape-machine"
-PROJECT_SCHEMA_VERSION = 3
+PROJECT_SCHEMA_VERSION = 4
 PROJECT_COMMENT_PREFIX = "TAPE_MACHINE_PROJECT:"
 WAV_FORMATS = {"WAV", "WAVEX", "RF64"}
 MIX_MIN_LEVEL_DB = -60.0
@@ -94,12 +95,21 @@ class ProjectMetadata:
     output_device: DeviceReference | None = None
     track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS
     bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
+    buffer_size: int = 0
     source_comment: str | None = None
     mix: MixerMetadata = field(default_factory=MixerMetadata)
 
     def __post_init__(self) -> None:
         if not isinstance(self.mix, MixerMetadata):
             raise ValueError("Project mix must be a mixer metadata object.")
+        if (
+            not isinstance(self.buffer_size, int)
+            or isinstance(self.buffer_size, bool)
+            or self.buffer_size not in AUDIO_BUFFER_SIZES
+        ):
+            raise ValueError(
+                f"Invalid project audio buffer size {self.buffer_size!r}."
+            )
         if len(self.track_inputs) != PROJECT_TRACK_COUNT:
             raise ValueError(
                 f"Project input routing must contain {PROJECT_TRACK_COUNT} tracks."
@@ -135,6 +145,7 @@ class ProjectMetadata:
         output_device: DeviceReference,
         track_inputs: tuple[TrackInputRoute, ...],
         bus_outputs: tuple[int | None, ...],
+        buffer_size: int,
     ) -> ProjectMetadata:
         """Return metadata updated from saved Audio Settings."""
         return replace(
@@ -143,6 +154,7 @@ class ProjectMetadata:
             output_device=output_device,
             track_inputs=track_inputs,
             bus_outputs=bus_outputs,
+            buffer_size=buffer_size,
         )
 
     def with_mix(self, mix: MixerMetadata) -> ProjectMetadata:
@@ -161,6 +173,7 @@ class ProjectMetadata:
                 for route in self.track_inputs
             ],
             "bus_outputs": list(self.bus_outputs),
+            "buffer_size": self.buffer_size,
             "mix": _mixer_payload(self.mix),
         }
         if self.source_comment:
@@ -186,7 +199,7 @@ class ProjectMetadata:
         if (
             not isinstance(schema_version, int)
             or isinstance(schema_version, bool)
-            or schema_version not in {1, 2, PROJECT_SCHEMA_VERSION}
+            or schema_version not in {1, 2, 3, PROJECT_SCHEMA_VERSION}
         ):
             raise ProjectError(
                 "This project uses an unsupported metadata schema version."
@@ -205,11 +218,15 @@ class ProjectMetadata:
                 if schema_version == 1
                 else _mixer_from_payload(payload["mix"])
             )
+            buffer_size = (
+                payload["buffer_size"] if schema_version >= 4 else 0
+            )
             return cls(
                 input_device=_reference_from_payload(payload.get("input_device")),
                 output_device=_reference_from_payload(payload.get("output_device")),
                 track_inputs=track_inputs,
                 bus_outputs=bus_outputs,
+                buffer_size=buffer_size,
                 source_comment=source_comment,
                 mix=mix,
             )

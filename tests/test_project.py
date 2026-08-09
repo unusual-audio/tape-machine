@@ -1,6 +1,7 @@
 """Tests for portable WAV project files."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ def project_metadata() -> ProjectMetadata:
         output_device=DeviceReference("Studio Output", "Core Audio"),
         track_inputs=(0, 1, 7, None, None, None, None, None),
         bus_outputs=(0, 3),
+        buffer_size=256,
         mix=mix,
     )
 
@@ -123,23 +125,26 @@ def test_schema_one_metadata_loads_with_default_mix() -> None:
     upgraded_payload = json.loads(
         loaded.to_comment()[len(PROJECT_COMMENT_PREFIX) :]
     )
-    assert upgraded_payload["schema_version"] == 3
+    assert upgraded_payload["schema_version"] == 4
     assert "mix" in upgraded_payload
+    assert loaded.buffer_size == 0
 
 
-def test_stereo_bus_inputs_round_trip_as_schema_three_strings() -> None:
+def test_stereo_bus_inputs_and_buffer_round_trip_as_schema_four() -> None:
     metadata = project_metadata().with_audio(
         DeviceReference("Studio Input", "Core Audio"),
         DeviceReference("Studio Output", "Core Audio"),
         (StereoBusInput.LEFT, StereoBusInput.RIGHT) + (None,) * 6,
         (0, 1),
+        512,
     )
 
     comment = metadata.to_comment()
     payload = json.loads(comment[len(PROJECT_COMMENT_PREFIX) :])
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["track_inputs"][:2] == ["stereo_bus_l", "stereo_bus_r"]
+    assert payload["buffer_size"] == 512
     assert ProjectMetadata.from_comment(comment) == metadata
 
 
@@ -148,12 +153,43 @@ def test_schema_two_numeric_routes_still_load() -> None:
         project_metadata().to_comment()[len(PROJECT_COMMENT_PREFIX) :]
     )
     payload["schema_version"] = 2
+    del payload["buffer_size"]
 
     loaded = ProjectMetadata.from_comment(
         PROJECT_COMMENT_PREFIX + json.dumps(payload)
     )
 
-    assert loaded == project_metadata()
+    assert loaded == replace(project_metadata(), buffer_size=0)
+
+
+def test_schema_three_loopback_routes_default_buffer_to_automatic() -> None:
+    metadata = replace(
+        project_metadata(),
+        track_inputs=(StereoBusInput.LEFT,) + (None,) * 7,
+    )
+    payload = json.loads(
+        metadata.to_comment()[len(PROJECT_COMMENT_PREFIX) :]
+    )
+    payload["schema_version"] = 3
+    del payload["buffer_size"]
+
+    loaded = ProjectMetadata.from_comment(
+        PROJECT_COMMENT_PREFIX + json.dumps(payload)
+    )
+
+    assert loaded == replace(metadata, buffer_size=0)
+
+
+def test_project_metadata_rejects_unknown_buffer_size() -> None:
+    payload = json.loads(
+        project_metadata().to_comment()[len(PROJECT_COMMENT_PREFIX) :]
+    )
+    payload["buffer_size"] = 16
+
+    with pytest.raises(ProjectError, match="buffer size"):
+        ProjectMetadata.from_comment(
+            PROJECT_COMMENT_PREFIX + json.dumps(payload)
+        )
 
 
 @pytest.mark.parametrize(

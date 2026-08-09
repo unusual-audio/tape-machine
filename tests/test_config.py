@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ def stored_audio_settings() -> StoredAudioSettings:
         sample_rate=96_000,
         track_inputs=(7, 6, 5, 4, 3, 2, 1, 0),
         bus_outputs=(2, 3),
+        buffer_size=256,
     )
 
 
@@ -62,12 +64,46 @@ def test_config_round_trips_stereo_bus_input_defaults(tmp_path: Path) -> None:
     AppConfigStore(path).save(AppConfig(default_audio_settings=stored))
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["default_audio_settings"]["track_inputs"][:2] == [
         "stereo_bus_l",
         "stereo_bus_r",
     ]
+    assert payload["default_audio_settings"]["buffer_size"] == 0
     assert AppConfigStore(path).load().default_audio_settings == stored
+
+
+def test_schema_two_config_defaults_buffer_size_to_automatic(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    stored = replace(
+        stored_audio_settings(),
+        track_inputs=(StereoBusInput.LEFT,) + (None,) * 7,
+    )
+    AppConfigStore(path).save(AppConfig(default_audio_settings=stored))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    del payload["default_audio_settings"]["buffer_size"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = AppConfigStore(path).load().default_audio_settings
+
+    assert loaded == replace(stored, buffer_size=0)
+
+
+def test_invalid_stored_buffer_size_discards_audio_defaults(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    AppConfigStore(path).save(
+        AppConfig(default_audio_settings=stored_audio_settings())
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["default_audio_settings"]["buffer_size"] = 16
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert AppConfigStore(path).load().default_audio_settings is None
 
 
 def test_recent_files_are_normalized_deduplicated_and_limited(
@@ -145,7 +181,9 @@ def test_schema_one_config_with_numeric_routes_still_loads(
         encoding="utf-8",
     )
 
-    assert AppConfigStore(path).load().default_audio_settings == stored
+    assert AppConfigStore(path).load().default_audio_settings == replace(
+        stored, buffer_size=0
+    )
 
 
 @pytest.mark.parametrize(
@@ -168,7 +206,9 @@ def test_invalid_top_level_config_raises_a_readable_error(
 
 
 def test_stored_audio_uses_stable_device_references() -> None:
-    settings = AudioSettings(7, 9, 48_000, (0,) + (None,) * 7, (0, 1))
+    settings = AudioSettings(
+        7, 9, 48_000, (0,) + (None,) * 7, (0, 1), 512
+    )
     input_device = AudioDevice(7, "Input", "Core Audio", 8, 0, 48_000)
     output_device = AudioDevice(9, "Output", "Core Audio", 0, 2, 48_000)
 
@@ -181,6 +221,7 @@ def test_stored_audio_uses_stable_device_references() -> None:
     assert stored.sample_rate == 48_000
     assert stored.track_inputs == settings.track_inputs
     assert stored.bus_outputs == settings.bus_outputs
+    assert stored.buffer_size == 512
 
 
 def test_stored_audio_resolves_current_runtime_device_ids() -> None:
@@ -205,4 +246,5 @@ def test_stored_audio_resolves_current_runtime_device_ids() -> None:
         96_000,
         stored.track_inputs,
         stored.bus_outputs,
+        stored.buffer_size,
     )

@@ -55,8 +55,11 @@ def settings(
         None,
     ),
     bus_outputs: tuple[int | None, ...] = (0, 1),
+    buffer_size: int = 0,
 ) -> AudioSettings:
-    return AudioSettings(1, 2, 48_000, track_inputs, bus_outputs)
+    return AudioSettings(
+        1, 2, 48_000, track_inputs, bus_outputs, buffer_size
+    )
 
 
 @dataclass
@@ -148,6 +151,21 @@ def test_stream_start_failure_is_descriptive_and_closes_stream() -> None:
 
     assert engine.running is False
     assert backend.streams[0].closed is True
+
+
+def test_stream_uses_selected_fixed_buffer_size() -> None:
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+
+    engine.start(
+        settings(buffer_size=256),
+        monitored_state(0),
+        device(index=1),
+        device(index=2),
+    )
+
+    assert backend.streams[0].kwargs["blocksize"] == 256
+    engine.stop()
 
 
 def test_transient_core_audio_start_error_is_retried() -> None:

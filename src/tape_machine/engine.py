@@ -235,7 +235,7 @@ class AudioEngine:
             try:
                 stream = self.backend.RawStream(
                     samplerate=settings.sample_rate,
-                    blocksize=0,
+                    blocksize=settings.buffer_size,
                     device=(
                         settings.input_device_id,
                         settings.output_device_id,

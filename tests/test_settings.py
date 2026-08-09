@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
+
 from tape_machine.audio import (
+    AUDIO_BUFFER_SIZES,
     UNASSIGNED_BUS_OUTPUTS,
     UNASSIGNED_TRACK_INPUTS,
     AudioDevice,
@@ -14,7 +17,9 @@ from tape_machine.audio import (
     TrackInputRoute,
 )
 from tape_machine.settings import (
+    AudioSettingsDraft,
     AudioSettingsWindow,
+    BufferSizeChoice,
     DeviceChoice,
     input_source_rows,
 )
@@ -197,7 +202,9 @@ def test_changing_output_device_preserves_portable_stereo_routing() -> None:
 def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
     input_device = AudioDevice(1, "Interface", "Core Audio", 8, 2, 48_000)
     output_device = AudioDevice(1, "Interface", "Core Audio", 8, 2, 48_000)
-    settings = AudioSettings(1, 1, 48_000, (0,) + (None,) * 7, (0, 1))
+    settings = AudioSettings(
+        1, 1, 48_000, (0,) + (None,) * 7, (0, 1), 256
+    )
     compatibility_calls: list[AudioSettings] = []
     window = AudioSettingsWindow.__new__(AudioSettingsWindow)
     window._updating = False
@@ -213,6 +220,9 @@ def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
     )
     window.sample_rate_selection = SimpleNamespace(
         items=[], value=None, enabled=True
+    )
+    window.buffer_size_selection = SimpleNamespace(
+        value=BufferSizeChoice(256)
     )
     window.save_button = SimpleNamespace(enabled=False)
     window.save_as_default_button = SimpleNamespace(enabled=False)
@@ -236,7 +246,9 @@ def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
 def test_save_as_default_applies_and_persists_without_closing() -> None:
     input_device = AudioDevice(1, "Input", "Core Audio", 8, 0, 48_000)
     output_device = AudioDevice(2, "Output", "Core Audio", 0, 2, 48_000)
-    settings = AudioSettings(1, 2, 48_000, (0,) + (None,) * 7, (0, 1))
+    settings = AudioSettings(
+        1, 2, 48_000, (0,) + (None,) * 7, (0, 1), 512
+    )
     events: list[tuple[str, AudioSettings]] = []
     hides: list[None] = []
     window = AudioSettingsWindow.__new__(AudioSettingsWindow)
@@ -249,6 +261,9 @@ def test_save_as_default_applies_and_persists_without_closing() -> None:
     window.track_inputs = settings.track_inputs
     window.bus_outputs = settings.bus_outputs
     window._selected_rate = lambda: settings.sample_rate
+    window.buffer_size_selection = SimpleNamespace(
+        value=BufferSizeChoice(512)
+    )
     window.save_button = SimpleNamespace(enabled=True)
     window.save_as_default_button = SimpleNamespace(enabled=True)
     window.status_label = SimpleNamespace(text="")
@@ -261,6 +276,26 @@ def test_save_as_default_applies_and_persists_without_closing() -> None:
     assert events == [("applied", settings), ("saved", settings)]
     assert hides == []
     assert window.status_label.text == "Applied and saved as default."
+
+
+def test_buffer_size_choices_show_samples_and_automatic() -> None:
+    assert str(BufferSizeChoice(0)) == "Automatic"
+    assert str(BufferSizeChoice(128)) == "128 samples"
+
+
+@pytest.mark.parametrize("buffer_size", AUDIO_BUFFER_SIZES)
+def test_buffer_size_selection_round_trips_standard_choices(
+    buffer_size: int,
+) -> None:
+    window = AudioSettingsWindow.__new__(AudioSettingsWindow)
+    window.buffer_size_selection = SimpleNamespace(
+        value=BufferSizeChoice(buffer_size)
+    )
+
+    assert window._selected_buffer_size() == buffer_size
+    assert AudioSettingsDraft.from_settings(
+        AudioSettings(1, 2, 48_000, buffer_size=buffer_size)
+    ).buffer_size == buffer_size
 
 
 def test_save_as_default_button_visibility_tracks_settings_context() -> None:

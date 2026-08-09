@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from tape_machine.audio import (
+    AUDIO_BUFFER_SIZES,
     PROJECT_TRACK_COUNT,
     STEREO_BUS_CHANNEL_COUNT,
     AudioDevice,
@@ -21,7 +22,7 @@ from tape_machine.audio import (
 )
 
 
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 MAX_RECENT_FILES = 10
 
 
@@ -46,6 +47,7 @@ class StoredAudioSettings:
     sample_rate: int
     track_inputs: tuple[TrackInputRoute, ...]
     bus_outputs: tuple[int | None, ...]
+    buffer_size: int = 0
 
     @classmethod
     def from_settings(
@@ -60,6 +62,7 @@ class StoredAudioSettings:
             sample_rate=settings.sample_rate,
             track_inputs=settings.track_inputs,
             bus_outputs=settings.bus_outputs,
+            buffer_size=settings.buffer_size,
         )
 
     def resolve(self, service: AudioDeviceService) -> AudioSettings | None:
@@ -74,6 +77,7 @@ class StoredAudioSettings:
             sample_rate=self.sample_rate,
             track_inputs=self.track_inputs,
             bus_outputs=self.bus_outputs,
+            buffer_size=self.buffer_size,
         )
 
 
@@ -147,7 +151,7 @@ class AppConfigStore:
         if (
             not isinstance(schema_version, int)
             or isinstance(schema_version, bool)
-            or schema_version not in {1, CONFIG_SCHEMA_VERSION}
+            or schema_version not in {1, 2, CONFIG_SCHEMA_VERSION}
         ):
             raise AppConfigError(
                 "Application configuration has an unsupported version."
@@ -157,6 +161,7 @@ class AppConfigStore:
         default_audio = _parse_audio_settings(
             raw.get("default_audio_settings"),
             allow_loopback=schema_version >= 2,
+            allow_buffer_size=schema_version >= 3,
         )
         positions = raw.get("window_positions")
         if not isinstance(positions, dict):
@@ -294,13 +299,14 @@ def _parse_track_inputs(
 
 
 def _parse_audio_settings(
-    value: Any, *, allow_loopback: bool
+    value: Any, *, allow_loopback: bool, allow_buffer_size: bool
 ) -> StoredAudioSettings | None:
     if not isinstance(value, dict):
         return None
     input_device = _parse_device_reference(value.get("input_device"))
     output_device = _parse_device_reference(value.get("output_device"))
     sample_rate = value.get("sample_rate")
+    buffer_size = value.get("buffer_size", 0) if allow_buffer_size else 0
     track_inputs = _parse_track_inputs(
         value.get("track_inputs"), allow_loopback=allow_loopback
     )
@@ -313,6 +319,9 @@ def _parse_audio_settings(
         or not isinstance(sample_rate, int)
         or isinstance(sample_rate, bool)
         or sample_rate <= 0
+        or not isinstance(buffer_size, int)
+        or isinstance(buffer_size, bool)
+        or buffer_size not in AUDIO_BUFFER_SIZES
         or track_inputs is None
         or bus_outputs is None
     ):
@@ -323,6 +332,7 @@ def _parse_audio_settings(
         sample_rate=sample_rate,
         track_inputs=track_inputs,
         bus_outputs=bus_outputs,
+        buffer_size=buffer_size,
     )
 
 
@@ -359,6 +369,7 @@ def _audio_settings_payload(
             for route in settings.track_inputs
         ],
         "bus_outputs": list(settings.bus_outputs),
+        "buffer_size": settings.buffer_size,
     }
 
 

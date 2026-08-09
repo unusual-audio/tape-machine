@@ -610,6 +610,7 @@ class TapeMachine(toga.App):
             sample_rate=self.project.sample_rate,
             track_inputs=self.project.metadata.track_inputs,
             bus_outputs=self.project.metadata.bus_outputs,
+            buffer_size=self.project.metadata.buffer_size,
         )
         self.settings_window.open(
             draft,
@@ -690,6 +691,7 @@ class TapeMachine(toga.App):
                 output_device.reference,
                 settings.track_inputs,
                 settings.bus_outputs,
+                settings.buffer_size,
             ).with_mix(self.mixer_state.to_metadata(settings.track_inputs))
         )
         try:
@@ -752,6 +754,7 @@ class TapeMachine(toga.App):
             output_device=output_device.reference,
             track_inputs=settings.track_inputs,
             bus_outputs=settings.bus_outputs,
+            buffer_size=settings.buffer_size,
         )
         try:
             project = AudioProject.create(path, settings.sample_rate, metadata)
@@ -1248,6 +1251,7 @@ class TapeMachine(toga.App):
             self.project.sample_rate,
             metadata.track_inputs,
             metadata.bus_outputs,
+            metadata.buffer_size,
         )
         self.audio_service.current_settings = settings
         return self.audio_service.compatibility_error(settings)
