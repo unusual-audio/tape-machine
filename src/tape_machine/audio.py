@@ -10,7 +10,7 @@ import sounddevice
 
 
 SAMPLE_RATES = (44_100, 48_000, 88_200, 96_000, 176_400, 192_000)
-AUDIO_BUFFER_SIZES = (0, 32, 64, 128, 256, 512, 1024, 2048)
+AUDIO_BUFFER_SIZES = (0, 16, 32, 64, 128, 256, 512, 1024, 2048)
 PROJECT_TRACK_COUNT = 8
 STEREO_BUS_CHANNEL_COUNT = 2
 UNASSIGNED_BUS_OUTPUTS: tuple[int | None, ...] = (None,) * STEREO_BUS_CHANNEL_COUNT
@@ -63,6 +63,8 @@ class AudioDevice:
     max_input_channels: int
     max_output_channels: int
     default_sample_rate: int
+    input_channel_names: tuple[str | None, ...] = ()
+    output_channel_names: tuple[str | None, ...] = ()
 
     def label(self, direction: str) -> str:
         """Return an unambiguous label for an input or output selector."""
@@ -79,7 +81,7 @@ class AudioDevice:
 
     @property
     def reference(self) -> DeviceReference:
-        """Return the stable descriptor stored in portable project metadata."""
+        """Return the stable descriptor stored in application configuration."""
         return DeviceReference(name=self.name, host_api=self.host_api)
 
 
@@ -161,15 +163,34 @@ class AudioDeviceService:
             except (IndexError, KeyError, TypeError):
                 host_api = f"Host API {host_api_index}"
 
+            max_input_channels = int(
+                raw_device.get("max_input_channels", 0)
+            )
+            max_output_channels = int(
+                raw_device.get("max_output_channels", 0)
+            )
+
             devices.append(
                 AudioDevice(
                     index=index,
                     name=str(raw_device.get("name", f"Device {index}")),
                     host_api=host_api,
-                    max_input_channels=int(raw_device.get("max_input_channels", 0)),
-                    max_output_channels=int(raw_device.get("max_output_channels", 0)),
+                    max_input_channels=max_input_channels,
+                    max_output_channels=max_output_channels,
                     default_sample_rate=int(
                         round(float(raw_device.get("default_samplerate", 48_000)))
+                    ),
+                    input_channel_names=self._channel_names(
+                        index,
+                        max_input_channels,
+                        is_input=True,
+                        host_api=host_api,
+                    ),
+                    output_channel_names=self._channel_names(
+                        index,
+                        max_output_channels,
+                        is_input=False,
+                        host_api=host_api,
                     ),
                 )
             )
@@ -190,6 +211,42 @@ class AudioDeviceService:
             output_default, self.output_devices
         )
         return self.input_devices, self.output_devices
+
+    def _channel_names(
+        self,
+        device_index: int,
+        channel_count: int,
+        *,
+        is_input: bool,
+        host_api: str,
+    ) -> tuple[str | None, ...]:
+        """Copy optional Core Audio channel names from PortAudio."""
+        missing = (None,) * channel_count
+        if host_api != "Core Audio" or channel_count == 0:
+            return missing
+
+        library = getattr(self._backend, "_lib", None)
+        ffi = getattr(self._backend, "_ffi", None)
+        get_channel_name = getattr(
+            library, "PaMacCore_GetChannelName", None
+        )
+        if ffi is None or not callable(get_channel_name):
+            return missing
+
+        names: list[str | None] = []
+        for channel_index in range(channel_count):
+            try:
+                pointer = get_channel_name(
+                    device_index, channel_index, is_input
+                )
+                if pointer == ffi.NULL:
+                    names.append(None)
+                    continue
+                name = ffi.string(pointer).decode("utf-8").strip()
+                names.append(name or None)
+            except Exception:
+                names.append(None)
+        return tuple(names)
 
     def supported_sample_rates(
         self,

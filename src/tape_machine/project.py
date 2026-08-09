@@ -14,12 +14,8 @@ import numpy as np
 import soundfile
 
 from tape_machine.audio import (
-    AUDIO_BUFFER_SIZES,
     PROJECT_TRACK_COUNT,
     STEREO_BUS_CHANNEL_COUNT,
-    UNASSIGNED_BUS_OUTPUTS,
-    UNASSIGNED_TRACK_INPUTS,
-    DeviceReference,
     StereoBusInput,
     TrackInputRoute,
     is_physical_input,
@@ -27,7 +23,7 @@ from tape_machine.audio import (
 
 
 PROJECT_APPLICATION_ID = "pkg.unusualaudio.tape-machine"
-PROJECT_SCHEMA_VERSION = 4
+PROJECT_SCHEMA_VERSION = 5
 PROJECT_COMMENT_PREFIX = "TAPE_MACHINE_PROJECT:"
 WAV_FORMATS = {"WAV", "WAVEX", "RF64"}
 MIX_MIN_LEVEL_DB = -60.0
@@ -91,71 +87,16 @@ class MixerMetadata:
 class ProjectMetadata:
     """Versioned project configuration embedded in WAV comment metadata."""
 
-    input_device: DeviceReference | None = None
-    output_device: DeviceReference | None = None
-    track_inputs: tuple[TrackInputRoute, ...] = UNASSIGNED_TRACK_INPUTS
-    bus_outputs: tuple[int | None, ...] = UNASSIGNED_BUS_OUTPUTS
-    buffer_size: int = 0
     source_comment: str | None = None
     mix: MixerMetadata = field(default_factory=MixerMetadata)
 
     def __post_init__(self) -> None:
         if not isinstance(self.mix, MixerMetadata):
             raise ValueError("Project mix must be a mixer metadata object.")
-        if (
-            not isinstance(self.buffer_size, int)
-            or isinstance(self.buffer_size, bool)
-            or self.buffer_size not in AUDIO_BUFFER_SIZES
+        if self.source_comment is not None and not isinstance(
+            self.source_comment, str
         ):
-            raise ValueError(
-                f"Invalid project audio buffer size {self.buffer_size!r}."
-            )
-        if len(self.track_inputs) != PROJECT_TRACK_COUNT:
-            raise ValueError(
-                f"Project input routing must contain {PROJECT_TRACK_COUNT} tracks."
-            )
-        for channel in self.track_inputs:
-            if channel is not None and (
-                not isinstance(channel, StereoBusInput)
-                and (not is_physical_input(channel) or channel < 0)
-            ):
-                raise ValueError(f"Invalid project input channel {channel!r}.")
-
-        if len(self.bus_outputs) != STEREO_BUS_CHANNEL_COUNT:
-            raise ValueError(
-                "Project output routing must contain two stereo bus channels."
-            )
-        assigned_outputs: set[int] = set()
-        for channel in self.bus_outputs:
-            if channel is None:
-                continue
-            if (
-                not isinstance(channel, int)
-                or isinstance(channel, bool)
-                or channel < 0
-            ):
-                raise ValueError(f"Invalid project output channel {channel!r}.")
-            if channel in assigned_outputs:
-                raise ValueError("Stereo bus outputs must be distinct.")
-            assigned_outputs.add(channel)
-
-    def with_audio(
-        self,
-        input_device: DeviceReference,
-        output_device: DeviceReference,
-        track_inputs: tuple[TrackInputRoute, ...],
-        bus_outputs: tuple[int | None, ...],
-        buffer_size: int,
-    ) -> ProjectMetadata:
-        """Return metadata updated from saved Audio Settings."""
-        return replace(
-            self,
-            input_device=input_device,
-            output_device=output_device,
-            track_inputs=track_inputs,
-            bus_outputs=bus_outputs,
-            buffer_size=buffer_size,
-        )
+            raise ValueError("Project source comment must be text.")
 
     def with_mix(self, mix: MixerMetadata) -> ProjectMetadata:
         """Return metadata updated from the project mixer."""
@@ -166,14 +107,6 @@ class ProjectMetadata:
         payload: dict[str, Any] = {
             "application": PROJECT_APPLICATION_ID,
             "schema_version": PROJECT_SCHEMA_VERSION,
-            "input_device": _reference_payload(self.input_device),
-            "output_device": _reference_payload(self.output_device),
-            "track_inputs": [
-                route.value if isinstance(route, StereoBusInput) else route
-                for route in self.track_inputs
-            ],
-            "bus_outputs": list(self.bus_outputs),
-            "buffer_size": self.buffer_size,
             "mix": _mixer_payload(self.mix),
         }
         if self.source_comment:
@@ -199,36 +132,19 @@ class ProjectMetadata:
         if (
             not isinstance(schema_version, int)
             or isinstance(schema_version, bool)
-            or schema_version not in {1, 2, 3, PROJECT_SCHEMA_VERSION}
+            or schema_version != PROJECT_SCHEMA_VERSION
         ):
             raise ProjectError(
                 "This project uses an unsupported metadata schema version."
             )
 
         try:
-            track_inputs = _track_inputs_from_payload(
-                payload["track_inputs"], allow_loopback=schema_version >= 3
-            )
-            bus_outputs = tuple(payload["bus_outputs"])
             source_comment = payload.get("source_comment")
             if source_comment is not None and not isinstance(source_comment, str):
                 raise ValueError("source_comment must be text")
-            mix = (
-                MixerMetadata()
-                if schema_version == 1
-                else _mixer_from_payload(payload["mix"])
-            )
-            buffer_size = (
-                payload["buffer_size"] if schema_version >= 4 else 0
-            )
             return cls(
-                input_device=_reference_from_payload(payload.get("input_device")),
-                output_device=_reference_from_payload(payload.get("output_device")),
-                track_inputs=track_inputs,
-                bus_outputs=bus_outputs,
-                buffer_size=buffer_size,
                 source_comment=source_comment,
-                mix=mix,
+                mix=_mixer_from_payload(payload["mix"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProjectError(f"Project metadata is invalid: {exc}") from exc
@@ -284,7 +200,6 @@ class AudioProject:
     def open(
         cls,
         path: Path,
-        import_metadata: ProjectMetadata,
     ) -> AudioProject:
         """Open a tagged project or import an untagged eight-channel WAV."""
         path = Path(path)
@@ -305,10 +220,7 @@ class AudioProject:
             metadata = ProjectMetadata.from_comment(comment)
             dirty = metadata is None
             if metadata is None:
-                metadata = replace(
-                    import_metadata,
-                    source_comment=comment or None,
-                )
+                metadata = ProjectMetadata(source_comment=comment or None)
         finally:
             inspection_file.close()
 
@@ -493,43 +405,6 @@ class AudioProject:
     def close(self) -> None:
         """Close the underlying SoundFile handle."""
         self.audio_file.close()
-
-
-def _reference_payload(reference: DeviceReference | None) -> dict[str, str] | None:
-    if reference is None:
-        return None
-    return {"name": reference.name, "host_api": reference.host_api}
-
-
-def _track_inputs_from_payload(
-    payload: object, *, allow_loopback: bool
-) -> tuple[TrackInputRoute, ...]:
-    if not isinstance(payload, list):
-        raise ValueError("track_inputs must be an array")
-    routes: list[TrackInputRoute] = []
-    for route in payload:
-        if isinstance(route, str) and allow_loopback:
-            try:
-                routes.append(StereoBusInput(route))
-            except ValueError as exc:
-                raise ValueError(f"unknown input source {route!r}") from exc
-        else:
-            routes.append(route)
-    return tuple(routes)
-
-
-def _reference_from_payload(payload: object) -> DeviceReference | None:
-    if payload is None:
-        return None
-    if not isinstance(payload, dict):
-        raise ValueError("device reference must be an object or null")
-    name = payload.get("name")
-    host_api = payload.get("host_api")
-    if not isinstance(name, str) or not name:
-        raise ValueError("device name must be non-empty text")
-    if not isinstance(host_api, str) or not host_api:
-        raise ValueError("device host_api must be non-empty text")
-    return DeviceReference(name=name, host_api=host_api)
 
 
 def _mixer_payload(mix: MixerMetadata) -> dict[str, Any]:

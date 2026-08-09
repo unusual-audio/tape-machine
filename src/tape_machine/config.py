@@ -22,7 +22,7 @@ from tape_machine.audio import (
 )
 
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 MAX_RECENT_FILES = 10
 
 
@@ -40,7 +40,7 @@ class WindowPosition:
 
 @dataclass(frozen=True, slots=True)
 class StoredAudioSettings:
-    """Portable application audio defaults independent of PortAudio IDs."""
+    """Portable global audio settings independent of PortAudio IDs."""
 
     input_device: DeviceReference
     output_device: DeviceReference
@@ -86,7 +86,7 @@ class AppConfig:
     """Versioned application state that is not stored in project WAV files."""
 
     recent_files: tuple[Path, ...] = ()
-    default_audio_settings: StoredAudioSettings | None = None
+    audio_settings: StoredAudioSettings | None = None
     main_window_position: WindowPosition | None = None
     audio_settings_window_position: WindowPosition | None = None
 
@@ -113,10 +113,8 @@ class AppConfig:
     def clear_recent_files(self) -> AppConfig:
         return replace(self, recent_files=())
 
-    def with_default_audio_settings(
-        self, settings: StoredAudioSettings
-    ) -> AppConfig:
-        return replace(self, default_audio_settings=settings)
+    def with_audio_settings(self, settings: StoredAudioSettings) -> AppConfig:
+        return replace(self, audio_settings=settings)
 
     def with_window_positions(
         self,
@@ -151,24 +149,20 @@ class AppConfigStore:
         if (
             not isinstance(schema_version, int)
             or isinstance(schema_version, bool)
-            or schema_version not in {1, 2, CONFIG_SCHEMA_VERSION}
+            or schema_version != CONFIG_SCHEMA_VERSION
         ):
             raise AppConfigError(
                 "Application configuration has an unsupported version."
             )
 
         recent_files = _parse_recent_files(raw.get("recent_files"))
-        default_audio = _parse_audio_settings(
-            raw.get("default_audio_settings"),
-            allow_loopback=schema_version >= 2,
-            allow_buffer_size=schema_version >= 3,
-        )
+        audio_settings = _parse_audio_settings(raw.get("audio_settings"))
         positions = raw.get("window_positions")
         if not isinstance(positions, dict):
             positions = {}
         return AppConfig(
             recent_files=recent_files,
-            default_audio_settings=default_audio,
+            audio_settings=audio_settings,
             main_window_position=_parse_position(positions.get("main")),
             audio_settings_window_position=_parse_position(
                 positions.get("audio_settings")
@@ -179,9 +173,7 @@ class AppConfigStore:
         payload = {
             "schema_version": CONFIG_SCHEMA_VERSION,
             "recent_files": [str(path) for path in config.recent_files],
-            "default_audio_settings": _audio_settings_payload(
-                config.default_audio_settings
-            ),
+            "audio_settings": _audio_settings_payload(config.audio_settings),
             "window_positions": {
                 "main": _position_payload(config.main_window_position),
                 "audio_settings": _position_payload(
@@ -273,9 +265,7 @@ def _parse_routes(
     return tuple(routes)
 
 
-def _parse_track_inputs(
-    value: Any, *, allow_loopback: bool
-) -> tuple[TrackInputRoute, ...] | None:
+def _parse_track_inputs(value: Any) -> tuple[TrackInputRoute, ...] | None:
     if not isinstance(value, list) or len(value) != PROJECT_TRACK_COUNT:
         return None
     routes: list[TrackInputRoute] = []
@@ -288,7 +278,7 @@ def _parse_track_inputs(
             and route >= 0
         ):
             routes.append(route)
-        elif isinstance(route, str) and allow_loopback:
+        elif isinstance(route, str):
             try:
                 routes.append(StereoBusInput(route))
             except ValueError:
@@ -298,18 +288,14 @@ def _parse_track_inputs(
     return tuple(routes)
 
 
-def _parse_audio_settings(
-    value: Any, *, allow_loopback: bool, allow_buffer_size: bool
-) -> StoredAudioSettings | None:
+def _parse_audio_settings(value: Any) -> StoredAudioSettings | None:
     if not isinstance(value, dict):
         return None
     input_device = _parse_device_reference(value.get("input_device"))
     output_device = _parse_device_reference(value.get("output_device"))
     sample_rate = value.get("sample_rate")
-    buffer_size = value.get("buffer_size", 0) if allow_buffer_size else 0
-    track_inputs = _parse_track_inputs(
-        value.get("track_inputs"), allow_loopback=allow_loopback
-    )
+    buffer_size = value.get("buffer_size")
+    track_inputs = _parse_track_inputs(value.get("track_inputs"))
     bus_outputs = _parse_routes(
         value.get("bus_outputs"), STEREO_BUS_CHANNEL_COUNT, unique=True
     )

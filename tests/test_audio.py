@@ -35,6 +35,14 @@ class FakeDefaults:
     device: tuple[int | None, int | None] = (0, 1)
 
 
+class FakeFFI:
+    NULL = None
+
+    @staticmethod
+    def string(value: bytes) -> bytes:
+        return value
+
+
 class FakeSoundDevice:
     def __init__(self) -> None:
         self.default = FakeDefaults()
@@ -69,6 +77,12 @@ class FakeSoundDevice:
         self.output_rates = {1: {44_100, 48_000}, 2: set(SAMPLE_RATES)}
         self.fail_query = False
         self.check_calls: list[tuple[str, dict[str, object]]] = []
+        self.channel_names: dict[
+            tuple[int, int, bool], bytes | Exception | None
+        ] = {}
+        self.channel_name_calls: list[tuple[int, int, bool]] = []
+        self._lib = self
+        self._ffi = FakeFFI()
 
     def query_devices(self):
         if self.fail_query:
@@ -77,6 +91,16 @@ class FakeSoundDevice:
 
     def query_hostapis(self):
         return self.host_apis
+
+    def PaMacCore_GetChannelName(
+        self, device: int, channel: int, is_input: bool
+    ) -> bytes | None:
+        key = (device, channel, is_input)
+        self.channel_name_calls.append(key)
+        value = self.channel_names.get(key)
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def check_input_settings(self, **kwargs):
         self.check_calls.append(("input", kwargs))
@@ -110,6 +134,67 @@ def test_initialize_filters_devices_and_uses_defaults(backend: FakeSoundDevice) 
     assert settings.required_output_channels == 0
     assert "Core Audio" in service.input_devices[0].label("input")
     assert "8 channels" in service.input_devices[0].label("input")
+
+
+def test_refresh_copies_core_audio_input_and_output_channel_names(
+    backend: FakeSoundDevice,
+) -> None:
+    backend.channel_names.update(
+        {
+            (0, 0, True): b"  Mic 1  ",
+            (0, 1, True): b"Mic 2",
+            (1, 0, False): b"Monitor L",
+            (1, 1, False): b"Monitor R",
+        }
+    )
+    service = AudioDeviceService(backend)
+
+    service.refresh_devices()
+
+    assert service.input_devices[0].input_channel_names[:3] == (
+        "Mic 1",
+        "Mic 2",
+        None,
+    )
+    assert service.output_devices[0].output_channel_names == (
+        "Monitor L",
+        "Monitor R",
+    )
+    assert (0, 0, True) in backend.channel_name_calls
+    assert (1, 0, False) in backend.channel_name_calls
+
+
+def test_invalid_channel_names_do_not_interrupt_device_refresh(
+    backend: FakeSoundDevice,
+) -> None:
+    backend.channel_names.update(
+        {
+            (0, 0, True): b"  ",
+            (0, 1, True): b"\xff",
+            (0, 2, True): RuntimeError("name unavailable"),
+        }
+    )
+    service = AudioDeviceService(backend)
+
+    service.refresh_devices()
+
+    assert service.input_devices[0].input_channel_names[:3] == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_non_core_audio_devices_do_not_query_mac_channel_names(
+    backend: FakeSoundDevice,
+) -> None:
+    backend.host_apis = ({"name": "ALSA"},)
+    service = AudioDeviceService(backend)
+
+    service.refresh_devices()
+
+    assert backend.channel_name_calls == []
+    assert service.input_devices[0].input_channel_names == (None,) * 8
 
 
 def test_missing_system_defaults_fall_back_to_first_devices(
@@ -281,7 +366,7 @@ def test_standard_audio_buffer_sizes_are_valid(
     )
 
 
-@pytest.mark.parametrize("buffer_size", [-1, 16, 4096, True])
+@pytest.mark.parametrize("buffer_size", [-1, 4096, True])
 def test_nonstandard_audio_buffer_sizes_are_rejected(
     backend: FakeSoundDevice, buffer_size: int
 ) -> None:

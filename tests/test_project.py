@@ -1,13 +1,11 @@
 """Tests for portable WAV project files."""
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import soundfile
 
-from tape_machine.audio import DeviceReference, StereoBusInput
 from tape_machine.project import (
     PROJECT_COMMENT_PREFIX,
     AudioProject,
@@ -33,14 +31,7 @@ def project_metadata() -> ProjectMetadata:
         ),
         bus_level_db=-6.0,
     )
-    return ProjectMetadata(
-        input_device=DeviceReference("Studio Input", "Core Audio"),
-        output_device=DeviceReference("Studio Output", "Core Audio"),
-        track_inputs=(0, 1, 7, None, None, None, None, None),
-        bus_outputs=(0, 3),
-        buffer_size=256,
-        mix=mix,
-    )
+    return ProjectMetadata(mix=mix)
 
 
 def test_create_and_reopen_rf64_project(tmp_path: Path) -> None:
@@ -56,7 +47,7 @@ def test_create_and_reopen_rf64_project(tmp_path: Path) -> None:
     assert project.dirty is False
     project.close()
 
-    reopened = AudioProject.open(path, ProjectMetadata())
+    reopened = AudioProject.open(path)
     assert reopened.metadata == project_metadata()
     assert reopened.dirty is False
     reopened.close()
@@ -77,7 +68,7 @@ def test_import_untagged_eight_channel_wav_preserves_comment(
         audio_file.comment = "Location recording"
         audio_file.write([[0.0] * 8])
 
-    project = AudioProject.open(path, ProjectMetadata())
+    project = AudioProject.open(path)
 
     assert project.sample_rate == 44_100
     assert project.dirty is True
@@ -95,7 +86,7 @@ def test_open_rejects_wrong_channel_count(tmp_path: Path) -> None:
     soundfile.write(path, [[0.0, 0.0]], 48_000)
 
     with pytest.raises(ProjectError, match="exactly 8 channels"):
-        AudioProject.open(path, ProjectMetadata())
+        AudioProject.open(path)
 
 
 def test_open_rejects_malformed_tagged_metadata(tmp_path: Path) -> None:
@@ -106,87 +97,29 @@ def test_open_rejects_malformed_tagged_metadata(tmp_path: Path) -> None:
         audio_file.comment = PROJECT_COMMENT_PREFIX + "{broken"
 
     with pytest.raises(ProjectError, match="not valid JSON"):
-        AudioProject.open(path, ProjectMetadata())
+        AudioProject.open(path)
 
 
-def test_schema_one_metadata_loads_with_default_mix() -> None:
-    current_payload = json.loads(
-        project_metadata().to_comment()[len(PROJECT_COMMENT_PREFIX) :]
-    )
-    current_payload["schema_version"] = 1
-    del current_payload["mix"]
-
-    loaded = ProjectMetadata.from_comment(
-        PROJECT_COMMENT_PREFIX + json.dumps(current_payload)
-    )
-
-    assert loaded is not None
-    assert loaded.mix == MixerMetadata()
-    upgraded_payload = json.loads(
-        loaded.to_comment()[len(PROJECT_COMMENT_PREFIX) :]
-    )
-    assert upgraded_payload["schema_version"] == 4
-    assert "mix" in upgraded_payload
-    assert loaded.buffer_size == 0
-
-
-def test_stereo_bus_inputs_and_buffer_round_trip_as_schema_four() -> None:
-    metadata = project_metadata().with_audio(
-        DeviceReference("Studio Input", "Core Audio"),
-        DeviceReference("Studio Output", "Core Audio"),
-        (StereoBusInput.LEFT, StereoBusInput.RIGHT) + (None,) * 6,
-        (0, 1),
-        512,
-    )
-
+def test_project_metadata_contains_only_project_state() -> None:
+    metadata = project_metadata()
     comment = metadata.to_comment()
     payload = json.loads(comment[len(PROJECT_COMMENT_PREFIX) :])
 
-    assert payload["schema_version"] == 4
-    assert payload["track_inputs"][:2] == ["stereo_bus_l", "stereo_bus_r"]
-    assert payload["buffer_size"] == 512
+    assert payload["schema_version"] == 5
+    assert set(payload) == {"application", "schema_version", "mix"}
     assert ProjectMetadata.from_comment(comment) == metadata
 
 
-def test_schema_two_numeric_routes_still_load() -> None:
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4])
+def test_legacy_project_metadata_schemas_are_rejected(
+    schema_version: int,
+) -> None:
     payload = json.loads(
         project_metadata().to_comment()[len(PROJECT_COMMENT_PREFIX) :]
     )
-    payload["schema_version"] = 2
-    del payload["buffer_size"]
+    payload["schema_version"] = schema_version
 
-    loaded = ProjectMetadata.from_comment(
-        PROJECT_COMMENT_PREFIX + json.dumps(payload)
-    )
-
-    assert loaded == replace(project_metadata(), buffer_size=0)
-
-
-def test_schema_three_loopback_routes_default_buffer_to_automatic() -> None:
-    metadata = replace(
-        project_metadata(),
-        track_inputs=(StereoBusInput.LEFT,) + (None,) * 7,
-    )
-    payload = json.loads(
-        metadata.to_comment()[len(PROJECT_COMMENT_PREFIX) :]
-    )
-    payload["schema_version"] = 3
-    del payload["buffer_size"]
-
-    loaded = ProjectMetadata.from_comment(
-        PROJECT_COMMENT_PREFIX + json.dumps(payload)
-    )
-
-    assert loaded == replace(metadata, buffer_size=0)
-
-
-def test_project_metadata_rejects_unknown_buffer_size() -> None:
-    payload = json.loads(
-        project_metadata().to_comment()[len(PROJECT_COMMENT_PREFIX) :]
-    )
-    payload["buffer_size"] = 16
-
-    with pytest.raises(ProjectError, match="buffer size"):
+    with pytest.raises(ProjectError, match="unsupported metadata schema"):
         ProjectMetadata.from_comment(
             PROJECT_COMMENT_PREFIX + json.dumps(payload)
         )

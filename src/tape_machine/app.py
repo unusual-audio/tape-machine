@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -11,6 +12,8 @@ from toga.style.pack import CENTER, COLUMN, ROW
 from toga_cocoa.libs import NSCursor
 
 from tape_machine.audio import (
+    UNASSIGNED_BUS_OUTPUTS,
+    UNASSIGNED_TRACK_INPUTS,
     AudioConfigurationError,
     AudioDeviceService,
     AudioSettings,
@@ -230,7 +233,7 @@ class TapeMachine(toga.App):
         self.audio_engine = AudioEngine()
         try:
             self.audio_service.refresh_devices()
-            stored_audio = self.app_config.default_audio_settings
+            stored_audio = self.app_config.audio_settings
             preferred_audio = (
                 stored_audio.resolve(self.audio_service)
                 if stored_audio is not None
@@ -239,8 +242,11 @@ class TapeMachine(toga.App):
             self.audio_service.current_settings = self.audio_service.suggest_settings(
                 preferred_audio
             )
+            self.global_audio_settings = self.audio_service.current_settings
             startup_error = None
         except AudioConfigurationError as exc:
+            self.audio_service.current_settings = None
+            self.global_audio_settings = None
             startup_error = str(exc)
 
         self.project: AudioProject | None = None
@@ -254,7 +260,6 @@ class TapeMachine(toga.App):
         self.momentary_shuttle_release: asyncio.Event | None = None
         self.momentary_shuttle_task: asyncio.Task[None] | None = None
         self.momentary_shuttle_resume = False
-        self.session_audio_settings = self.audio_service.current_settings
         self.project_audio_error: str | None = None
         self.audio_engine_error: str | None = None
 
@@ -301,8 +306,7 @@ class TapeMachine(toga.App):
 
         self.settings_window = AudioSettingsWindow(
             self.audio_service,
-            self._session_audio_settings_applied,
-            self._save_audio_settings_as_default,
+            self._audio_settings_applied,
             position=_fit_window_position(
                 self.app_config.audio_settings_window_position,
                 _AUDIO_SETTINGS_WINDOW_SIZE,
@@ -397,12 +401,16 @@ class TapeMachine(toga.App):
     def _build_project_screen(self) -> toga.Box:
         assert self.project is not None
         project = self.project
+        settings = self.audio_service.current_settings
+        track_inputs = (
+            settings.track_inputs
+            if settings is not None
+            else UNASSIGNED_TRACK_INPUTS
+        )
         self.mixer_state = MixerState.from_metadata(
-            project.metadata.track_inputs, project.metadata.mix
+            track_inputs, project.metadata.mix
         )
-        self.mixer_view = MixerView(
-            project.metadata.track_inputs, self.mixer_state
-        )
+        self.mixer_view = MixerView(track_inputs, self.mixer_state)
         self.mixer_state.on_change = self._mixer_changed
         self.transport = TransportController(project)
         self.audio_engine.set_transport(self.transport)
@@ -598,26 +606,29 @@ class TapeMachine(toga.App):
     def preferences(
         self, widget: toga.Widget | toga.Command | None = None, **kwargs: object
     ) -> None:
-        """Open session or project-specific Audio Settings."""
+        """Open the global Audio Settings, using a project's fixed rate."""
         if self.project is None:
-            self.settings_window.open(allow_save_as_default=True)
+            self.settings_window.open()
             return
 
         current = self.audio_service.current_settings
+        fallback = current or self.global_audio_settings
         draft = AudioSettingsDraft(
-            input_device_id=(current.input_device_id if current else None),
-            output_device_id=(current.output_device_id if current else None),
+            input_device_id=(fallback.input_device_id if fallback else None),
+            output_device_id=(fallback.output_device_id if fallback else None),
             sample_rate=self.project.sample_rate,
-            track_inputs=self.project.metadata.track_inputs,
-            bus_outputs=self.project.metadata.bus_outputs,
-            buffer_size=self.project.metadata.buffer_size,
+            track_inputs=(
+                fallback.track_inputs if fallback else UNASSIGNED_TRACK_INPUTS
+            ),
+            bus_outputs=(
+                fallback.bus_outputs if fallback else UNASSIGNED_BUS_OUTPUTS
+            ),
+            buffer_size=(fallback.buffer_size if fallback else 0),
         )
         self.settings_window.open(
             draft,
             locked_sample_rate=self.project.sample_rate,
             trusted_settings=(current if self.audio_engine.running else None),
-            on_applied=self._project_audio_settings_applied,
-            allow_save_as_default=False,
         )
 
     def _open_routing_settings(
@@ -634,12 +645,9 @@ class TapeMachine(toga.App):
         else:
             self.status_line_content.remove(self.routing_status_link_group)
 
-    def _session_audio_settings_applied(self, settings: AudioSettings) -> None:
-        self.audio_service.apply(settings)
-        self.session_audio_settings = settings
-        self._update_audio_summary()
-
-    def _save_audio_settings_as_default(self, settings: AudioSettings) -> None:
+    def _updated_config_for_audio_settings(
+        self, settings: AudioSettings
+    ) -> AppConfig:
         input_device = self.audio_service.device(settings.input_device_id, "input")
         output_device = self.audio_service.device(settings.output_device_id, "output")
         if input_device is None or output_device is None:
@@ -647,9 +655,21 @@ class TapeMachine(toga.App):
         stored = StoredAudioSettings.from_settings(
             settings, input_device, output_device
         )
-        updated = self.app_config.with_default_audio_settings(stored)
+        return self.app_config.with_audio_settings(stored)
+
+    def _audio_settings_applied(self, settings: AudioSettings) -> None:
+        if self.project is not None:
+            self._project_audio_settings_applied(settings)
+            return
+
+        self.audio_service.refresh_devices()
+        self.audio_service.validate(settings)
+        updated = self._updated_config_for_audio_settings(settings)
         self.config_store.save(updated)
         self.app_config = updated
+        self.global_audio_settings = settings
+        self.audio_service.current_settings = settings
+        self._update_audio_summary()
 
     def _project_audio_settings_applied(self, settings: AudioSettings) -> None:
         if self.project is None:
@@ -658,6 +678,8 @@ class TapeMachine(toga.App):
             raise ProjectError("The project mixer is not available.")
 
         old_settings = self.audio_service.current_settings
+        old_global_settings = self.global_audio_settings
+        old_config = self.app_config
         reuse_stream = self.audio_engine.running and settings == old_settings
         if not reuse_stream:
             self.audio_service.refresh_devices()
@@ -666,6 +688,16 @@ class TapeMachine(toga.App):
         output_device = self.audio_service.device(settings.output_device_id, "output")
         if input_device is None or output_device is None:
             raise AudioConfigurationError("The selected audio devices disappeared.")
+
+        global_sample_rate = (
+            old_global_settings.sample_rate
+            if old_global_settings is not None
+            else self.app_config.audio_settings.sample_rate
+            if self.app_config.audio_settings is not None
+            else settings.sample_rate
+        )
+        global_settings = replace(settings, sample_rate=global_sample_rate)
+        updated_config = self._updated_config_for_audio_settings(global_settings)
 
         old_engine_running = self.audio_engine.running
         if not reuse_stream:
@@ -685,33 +717,35 @@ class TapeMachine(toga.App):
                 self._schedule_audio_engine_dialog(str(exc))
                 raise
 
-        metadata = (
-            self.project.metadata.with_audio(
-                input_device.reference,
-                output_device.reference,
-                settings.track_inputs,
-                settings.bus_outputs,
-                settings.buffer_size,
-            ).with_mix(self.mixer_state.to_metadata(settings.track_inputs))
-        )
         try:
-            self.project.save(metadata)
+            self.config_store.save(updated_config)
         except Exception:
             if not reuse_stream:
                 self.audio_engine.stop()
                 restored = self._restore_audio_engine(
                     old_settings, old_engine_running
                 )
-                if not restored:
+                if old_engine_running and not restored:
                     self._set_audio_engine_failure(
                         "The previous audio stream could not be restored."
                     )
+            self.app_config = old_config
+            self.global_audio_settings = old_global_settings
             raise
+        self.app_config = updated_config
+        self.global_audio_settings = global_settings
         self.audio_service.current_settings = settings
         self.project_audio_error = None
         if self.mixer_view is not None:
             self.mixer_view.update_track_routes(settings.track_inputs)
             self.mixer_view.set_monitoring_available(True)
+        else:
+            self.mixer_state.update_input_routes(settings.track_inputs)
+        self.project.stage_metadata(
+            self.project.metadata.with_mix(
+                self.mixer_state.to_metadata(settings.track_inputs)
+            )
+        )
         self.audio_engine_error = None
         self._update_audio_summary()
 
@@ -743,21 +777,10 @@ class TapeMachine(toga.App):
         if path.suffix.lower() != ".wav":
             path = Path(f"{path}.wav")
 
-        input_device = self.audio_service.device(settings.input_device_id, "input")
-        output_device = self.audio_service.device(settings.output_device_id, "output")
-        if input_device is None or output_device is None:
-            await self._show_project_error("The selected audio devices disappeared.")
-            return
-
-        metadata = ProjectMetadata(
-            input_device=input_device.reference,
-            output_device=output_device.reference,
-            track_inputs=settings.track_inputs,
-            bus_outputs=settings.bus_outputs,
-            buffer_size=settings.buffer_size,
-        )
         try:
-            project = AudioProject.create(path, settings.sample_rate, metadata)
+            project = AudioProject.create(
+                path, settings.sample_rate, ProjectMetadata()
+            )
         except ProjectError as exc:
             await self._show_project_error(str(exc))
             return
@@ -782,13 +805,8 @@ class TapeMachine(toga.App):
         """Open one known path and share handling with the recent-files menu."""
 
         try:
-            self.audio_service.refresh_devices()
-            import_metadata = ProjectMetadata(
-                input_device=self._default_device_reference("input"),
-                output_device=self._default_device_reference("output"),
-            )
-            project = AudioProject.open(path, import_metadata)
-        except (AudioConfigurationError, ProjectError) as exc:
+            project = AudioProject.open(path)
+        except ProjectError as exc:
             if not path.exists():
                 self._forget_recent_file(path)
             await self._show_project_error(str(exc))
@@ -796,21 +814,9 @@ class TapeMachine(toga.App):
         self._enter_project(project)
         return True
 
-    def _default_device_reference(self, direction: str):
-        device_id = (
-            self.audio_service.default_input_device_id
-            if direction == "input"
-            else self.audio_service.default_output_device_id
-        )
-        if device_id is None:
-            return None
-        device = self.audio_service.device(device_id, direction)
-        return device.reference if device else None
-
     def _enter_project(self, project: AudioProject) -> None:
         self.settings_window.window.hide()
         self._remember_recent_file(project.path)
-        self.session_audio_settings = self.audio_service.current_settings
         self.project = project
         self.project_audio_error = self._resolve_project_audio()
         self._update_command_state()
@@ -1195,11 +1201,15 @@ class TapeMachine(toga.App):
         if self.mixer_state is not None and self.audio_engine.running:
             self.audio_engine.update_mix(self.mixer_state)
         if self.mixer_state is not None and self.project is not None:
+            settings = self.audio_service.current_settings
+            track_inputs = (
+                settings.track_inputs
+                if settings is not None
+                else UNASSIGNED_TRACK_INPUTS
+            )
             self.project.stage_metadata(
                 self.project.metadata.with_mix(
-                    self.mixer_state.to_metadata(
-                        self.project.metadata.track_inputs
-                    )
+                    self.mixer_state.to_metadata(track_inputs)
                 )
             )
 
@@ -1234,24 +1244,16 @@ class TapeMachine(toga.App):
             self.audio_service.current_settings = None
             return str(exc)
 
-        metadata = self.project.metadata
-        input_device = self.audio_service.resolve_device(
-            metadata.input_device, "input"
+        global_settings = self.audio_service.suggest_settings(
+            self.global_audio_settings
         )
-        output_device = self.audio_service.resolve_device(
-            metadata.output_device, "output"
-        )
-        if input_device is None or output_device is None:
+        self.global_audio_settings = global_settings
+        if global_settings is None:
             self.audio_service.current_settings = None
-            return "The project has no available input and output device pair."
+            return "No usable input and output device pair is available."
 
-        settings = AudioSettings(
-            input_device.index,
-            output_device.index,
-            self.project.sample_rate,
-            metadata.track_inputs,
-            metadata.bus_outputs,
-            metadata.buffer_size,
+        settings = replace(
+            global_settings, sample_rate=self.project.sample_rate
         )
         self.audio_service.current_settings = settings
         return self.audio_service.compatibility_error(settings)
@@ -1322,11 +1324,12 @@ class TapeMachine(toga.App):
         try:
             self.audio_service.refresh_devices()
             self.audio_service.current_settings = self.audio_service.suggest_settings(
-                self.session_audio_settings
+                self.global_audio_settings
             )
+            self.global_audio_settings = self.audio_service.current_settings
         except AudioConfigurationError:
             self.audio_service.current_settings = None
-        self.session_audio_settings = self.audio_service.current_settings
+            self.global_audio_settings = None
         self._update_command_state()
         self.main_window.content = self._build_initial_screen()
         self.main_window.title = self.formal_name
@@ -1380,20 +1383,8 @@ class TapeMachine(toga.App):
         settings = self.audio_service.current_settings
         input_device = None
         output_device = None
-        routing = (
-            settings.track_inputs
-            if settings is not None
-            else self.project.metadata.track_inputs
-            if self.project is not None
-            else ()
-        )
-        bus_outputs = (
-            settings.bus_outputs
-            if settings is not None
-            else self.project.metadata.bus_outputs
-            if self.project is not None
-            else ()
-        )
+        routing = settings.track_inputs if settings is not None else ()
+        bus_outputs = settings.bus_outputs if settings is not None else ()
         if settings is not None:
             input_device = self.audio_service.device(
                 settings.input_device_id, "input"

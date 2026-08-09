@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
 
@@ -22,6 +23,9 @@ from tape_machine.audio import (
     TrackInputRoute,
     is_physical_input,
 )
+
+
+_ROUTING_LABEL_WIDTH = 240
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +63,49 @@ class BufferSizeChoice:
         return f"{self.value} samples"
 
 
+def device_channel_labels(
+    device: AudioDevice,
+    direction: str,
+    row_count: int | None = None,
+) -> tuple[str, ...]:
+    """Build readable, unambiguous labels for physical device channels."""
+    if direction == "input":
+        channel_count = device.max_input_channels
+        channel_names = device.input_channel_names
+        prefix = "Input"
+    else:
+        channel_count = device.max_output_channels
+        channel_names = device.output_channel_names
+        prefix = "Output"
+
+    normalized_names = tuple(
+        name.strip() if isinstance(name, str) and name.strip() else None
+        for name in channel_names[:channel_count]
+    )
+    duplicate_counts = Counter(
+        name.casefold() for name in normalized_names if name is not None
+    )
+    labels: list[str] = []
+    for channel_index in range(
+        channel_count if row_count is None else row_count
+    ):
+        if channel_index >= channel_count:
+            labels.append(f"{prefix} {channel_index + 1} (unavailable)")
+            continue
+        name = (
+            normalized_names[channel_index]
+            if channel_index < len(normalized_names)
+            else None
+        )
+        if name is None:
+            labels.append(f"{prefix} {channel_index + 1}")
+        elif duplicate_counts[name.casefold()] > 1:
+            labels.append(f"{name} ({prefix} {channel_index + 1})")
+        else:
+            labels.append(name)
+    return tuple(labels)
+
+
 def input_source_rows(
     input_device: AudioDevice,
     track_inputs: tuple[TrackInputRoute, ...],
@@ -73,16 +120,11 @@ def input_source_rows(
         default=-1,
     ) + 1
     row_count = max(input_device.max_input_channels, stored_input_count)
+    physical_labels = device_channel_labels(
+        input_device, "input", row_count
+    )
     rows: list[tuple[TrackInputRoute, str]] = [
-        (
-            input_channel,
-            f"Input {input_channel + 1}"
-            + (
-                ""
-                if input_channel < input_device.max_input_channels
-                else " (unavailable)"
-            ),
-        )
+        (input_channel, physical_labels[input_channel])
         for input_channel in range(row_count)
     ]
     rows.extend(
@@ -126,14 +168,12 @@ class AudioSettingsWindow:
         self,
         service: AudioDeviceService,
         on_applied: Callable[[AudioSettings], None],
-        on_save_as_default: Callable[[AudioSettings], None],
         *,
         position: tuple[int, int] | None = None,
     ) -> None:
         self.service = service
         self.default_on_applied = on_applied
         self.on_applied = on_applied
-        self.on_save_as_default = on_save_as_default
         self.draft = AudioSettingsDraft.from_settings(None)
         self.locked_sample_rate: int | None = None
         self.trusted_settings: AudioSettings | None = None
@@ -167,12 +207,6 @@ class AudioSettingsWindow:
         self.save_button = toga.Button(
             "Save", on_press=self._save, enabled=False, margin_left=8
         )
-        self.save_as_default_button = toga.Button(
-            "Save as Default",
-            on_press=self._save_as_default,
-            enabled=False,
-            margin_left=8,
-        )
         self.button_row = toga.Box(
             children=[
                 toga.Button("Cancel", on_press=self._cancel),
@@ -182,7 +216,6 @@ class AudioSettingsWindow:
             justify_content=END,
             margin_top=20,
         )
-        self._save_as_default_visible = False
 
         content = toga.Box(
             children=[
@@ -233,11 +266,9 @@ class AudioSettingsWindow:
         locked_sample_rate: int | None = None,
         trusted_settings: AudioSettings | None = None,
         on_applied: Callable[[AudioSettings], None] | None = None,
-        allow_save_as_default: bool = False,
     ) -> None:
         """Refresh and show the window, or leave an already-visible draft intact."""
         if self.window.visible:
-            self._set_save_as_default_visible(allow_save_as_default)
             return
         self.draft = draft or AudioSettingsDraft.from_settings(
             self.service.current_settings
@@ -245,22 +276,11 @@ class AudioSettingsWindow:
         self.locked_sample_rate = locked_sample_rate
         self.trusted_settings = trusted_settings
         self.on_applied = on_applied or self.default_on_applied
-        self._set_save_as_default_visible(allow_save_as_default)
         self._load_draft()
         self.window.show()
 
-    def _set_save_as_default_visible(self, visible: bool) -> None:
-        if visible == self._save_as_default_visible:
-            return
-        self._save_as_default_visible = visible
-        if visible:
-            self.button_row.insert(1, self.save_as_default_button)
-        else:
-            self.button_row.remove(self.save_as_default_button)
-
     def _set_save_enabled(self, enabled: bool) -> None:
         self.save_button.enabled = enabled
-        self.save_as_default_button.enabled = enabled
 
     def _load_draft(self) -> None:
         self._updating = True
@@ -513,7 +533,7 @@ class AudioSettingsWindow:
                 margin_top=12,
             )
 
-        label_width = 170
+        label_width = _ROUTING_LABEL_WIDTH
         track_width = 44
         project_tracks_label = toga.Box(
             children=[
@@ -596,7 +616,7 @@ class AudioSettingsWindow:
                 margin_top=12,
             )
 
-        label_width = 170
+        label_width = _ROUTING_LABEL_WIDTH
         bus_width = 52
         stereo_bus_label = toga.Box(
             children=[
@@ -628,16 +648,14 @@ class AudioSettingsWindow:
             default=-1,
         ) + 1
         row_count = max(output_device.max_output_channels, stored_output_count)
+        output_labels = device_channel_labels(
+            output_device, "output", row_count
+        )
         rows: list[toga.Box] = []
         for output_channel in range(row_count):
-            availability = (
-                ""
-                if output_channel < output_device.max_output_channels
-                else " (unavailable)"
-            )
             cells: list[toga.Widget] = [
                 toga.Label(
-                    f"Output {output_channel + 1}{availability}",
+                    output_labels[output_channel],
                     width=label_width,
                     margin_top=4,
                 )
@@ -812,19 +830,6 @@ class AudioSettingsWindow:
             return
 
         self.window.hide()
-
-    def _save_as_default(self, widget: toga.Widget, **kwargs: object) -> None:
-        settings = self._selected_settings()
-        if settings is None:
-            return
-        try:
-            self.on_applied(settings)
-            self.on_save_as_default(settings)
-        except (AudioConfigurationError, RuntimeError) as exc:
-            self.status_label.text = str(exc)
-            return
-
-        self.status_label.text = "Applied and saved as default."
 
     def _cancel(self, widget: toga.Widget | None = None, **kwargs: object) -> None:
         self.window.hide()

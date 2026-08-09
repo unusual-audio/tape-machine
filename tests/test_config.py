@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -39,7 +38,7 @@ def test_config_round_trips_all_sections(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     config = AppConfig(
         recent_files=(tmp_path / "one.wav", tmp_path / "two.wav"),
-        default_audio_settings=stored_audio_settings(),
+        audio_settings=stored_audio_settings(),
         main_window_position=WindowPosition(120, 80),
         audio_settings_window_position=WindowPosition(-800, 140),
     )
@@ -50,7 +49,7 @@ def test_config_round_trips_all_sections(tmp_path: Path) -> None:
     assert not list(tmp_path.glob(".config.json.*.tmp"))
 
 
-def test_config_round_trips_stereo_bus_input_defaults(tmp_path: Path) -> None:
+def test_config_round_trips_stereo_bus_inputs(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     stored = stored_audio_settings()
     stored = StoredAudioSettings(
@@ -61,49 +60,30 @@ def test_config_round_trips_stereo_bus_input_defaults(tmp_path: Path) -> None:
         stored.bus_outputs,
     )
 
-    AppConfigStore(path).save(AppConfig(default_audio_settings=stored))
+    AppConfigStore(path).save(AppConfig(audio_settings=stored))
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
-    assert payload["default_audio_settings"]["track_inputs"][:2] == [
+    assert payload["schema_version"] == 4
+    assert payload["audio_settings"]["track_inputs"][:2] == [
         "stereo_bus_l",
         "stereo_bus_r",
     ]
-    assert payload["default_audio_settings"]["buffer_size"] == 0
-    assert AppConfigStore(path).load().default_audio_settings == stored
+    assert payload["audio_settings"]["buffer_size"] == 0
+    assert AppConfigStore(path).load().audio_settings == stored
 
 
-def test_schema_two_config_defaults_buffer_size_to_automatic(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "config.json"
-    stored = replace(
-        stored_audio_settings(),
-        track_inputs=(StereoBusInput.LEFT,) + (None,) * 7,
-    )
-    AppConfigStore(path).save(AppConfig(default_audio_settings=stored))
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["schema_version"] = 2
-    del payload["default_audio_settings"]["buffer_size"]
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    loaded = AppConfigStore(path).load().default_audio_settings
-
-    assert loaded == replace(stored, buffer_size=0)
-
-
-def test_invalid_stored_buffer_size_discards_audio_defaults(
+def test_invalid_stored_buffer_size_discards_audio_settings(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "config.json"
     AppConfigStore(path).save(
-        AppConfig(default_audio_settings=stored_audio_settings())
+        AppConfig(audio_settings=stored_audio_settings())
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["default_audio_settings"]["buffer_size"] = 16
+    payload["audio_settings"]["buffer_size"] = 4096
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert AppConfigStore(path).load().default_audio_settings is None
+    assert AppConfigStore(path).load().audio_settings is None
 
 
 def test_recent_files_are_normalized_deduplicated_and_limited(
@@ -124,66 +104,18 @@ def test_recent_files_are_normalized_deduplicated_and_limited(
     assert config.clear_recent_files().recent_files == ()
 
 
-def test_invalid_sections_are_discarded_without_losing_valid_sections(
-    tmp_path: Path,
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_legacy_config_schemas_are_rejected(
+    tmp_path: Path, schema_version: int
 ) -> None:
     path = tmp_path / "config.json"
     path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "recent_files": [str(tmp_path / "valid.wav"), 42],
-                "default_audio_settings": {"sample_rate": "fast"},
-                "window_positions": {
-                    "main": {"x": 20, "y": 40},
-                    "audio_settings": {"x": True, "y": 10},
-                },
-                "future_field": "ignored",
-            }
-        ),
+        json.dumps({"schema_version": schema_version}),
         encoding="utf-8",
     )
 
-    config = AppConfigStore(path).load()
-
-    assert config.recent_files == ((tmp_path / "valid.wav").resolve(),)
-    assert config.default_audio_settings is None
-    assert config.main_window_position == WindowPosition(20, 40)
-    assert config.audio_settings_window_position is None
-
-
-def test_schema_one_config_with_numeric_routes_still_loads(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "config.json"
-    stored = stored_audio_settings()
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "recent_files": [],
-                "default_audio_settings": {
-                    "input_device": {
-                        "name": stored.input_device.name,
-                        "host_api": stored.input_device.host_api,
-                    },
-                    "output_device": {
-                        "name": stored.output_device.name,
-                        "host_api": stored.output_device.host_api,
-                    },
-                    "sample_rate": stored.sample_rate,
-                    "track_inputs": list(stored.track_inputs),
-                    "bus_outputs": list(stored.bus_outputs),
-                },
-                "window_positions": {},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert AppConfigStore(path).load().default_audio_settings == replace(
-        stored, buffer_size=0
-    )
+    with pytest.raises(AppConfigError, match="unsupported version"):
+        AppConfigStore(path).load()
 
 
 @pytest.mark.parametrize(

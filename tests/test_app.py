@@ -86,8 +86,7 @@ class FakeLifecycleEngine:
 
 class FakeProject:
     def __init__(self) -> None:
-        reference = DeviceReference("Interface", "Test API")
-        self.metadata = ProjectMetadata(reference, reference)
+        self.metadata = ProjectMetadata()
         self.saved: list[ProjectMetadata] = []
         self.staged: list[ProjectMetadata] = []
         self.dirty = False
@@ -255,10 +254,7 @@ def test_status_link_hides_after_entering_a_fully_routed_project() -> None:
 
     app.project = SimpleNamespace(
         sample_rate=48_000,
-        metadata=ProjectMetadata(
-            track_inputs=tuple(range(8)),
-            bus_outputs=(0, 1),
-        ),
+        metadata=ProjectMetadata(),
     )
     app.audio_service.current_settings = AudioSettings(
         1, 1, 48_000, tuple(range(8)), (0, 1)
@@ -278,26 +274,59 @@ def test_routing_status_link_opens_audio_settings() -> None:
     assert calls == [None]
 
 
-def test_project_preferences_preserve_project_buffer_size() -> None:
+def test_project_preferences_use_global_settings_at_project_rate() -> None:
     opened: list[tuple[object, dict[str, object]]] = []
-    metadata = ProjectMetadata(buffer_size=512)
+    global_settings = AudioSettings(
+        1, 2, 96_000, tuple(range(8)), (0, 1), 512
+    )
+    active_settings = AudioSettings(
+        1, 2, 48_000, tuple(range(8)), (0, 1), 512
+    )
     app = SimpleNamespace(
-        project=SimpleNamespace(sample_rate=48_000, metadata=metadata),
-        audio_service=SimpleNamespace(
-            current_settings=AudioSettings(1, 2, 48_000, buffer_size=256)
-        ),
+        project=SimpleNamespace(sample_rate=48_000),
+        audio_service=SimpleNamespace(current_settings=active_settings),
+        global_audio_settings=global_settings,
         audio_engine=SimpleNamespace(running=True),
         settings_window=SimpleNamespace(
             open=lambda draft, **kwargs: opened.append((draft, kwargs))
         ),
-        _project_audio_settings_applied=object(),
     )
 
     TapeMachine.preferences(app)
 
     draft, kwargs = opened[0]
     assert draft.buffer_size == 512
+    assert draft.track_inputs == tuple(range(8))
+    assert draft.sample_rate == 48_000
     assert kwargs["locked_sample_rate"] == 48_000
+
+
+def test_project_uses_wav_rate_without_changing_global_sample_rate() -> None:
+    global_settings = AudioSettings(
+        1, 1, 96_000, tuple(range(8)), (0, 1), 256
+    )
+    compatibility_checks: list[AudioSettings] = []
+    service = SimpleNamespace(
+        current_settings=global_settings,
+        refresh_devices=lambda: None,
+        suggest_settings=lambda preferred: preferred,
+        compatibility_error=lambda settings: compatibility_checks.append(
+            settings
+        ),
+    )
+    app = SimpleNamespace(
+        project=SimpleNamespace(sample_rate=44_100),
+        audio_service=service,
+        global_audio_settings=global_settings,
+    )
+
+    error = TapeMachine._resolve_project_audio(app)
+
+    assert error is None
+    assert app.global_audio_settings == global_settings
+    assert service.current_settings.sample_rate == 44_100
+    assert service.current_settings.track_inputs == global_settings.track_inputs
+    assert compatibility_checks == [service.current_settings]
 
 
 def test_routing_status_link_is_inserted_and_removed_for_state_changes() -> None:
@@ -328,13 +357,6 @@ def test_mixer_change_rebuilds_running_engine_matrix() -> None:
     state = MixerState.from_track_inputs(routes)
     state.tracks[2].record_enabled = True
     project = FakeProject()
-    project.metadata = project.metadata.with_audio(
-        project.metadata.input_device,
-        project.metadata.output_device,
-        routes,
-        (0, 1),
-        project.metadata.buffer_size,
-    )
     app = SimpleNamespace(
         mixer_state=state,
         project=project,
@@ -344,6 +366,11 @@ def test_mixer_change_rebuilds_running_engine_matrix() -> None:
         audio_engine=SimpleNamespace(
             running=True,
             update_mix=lambda mixer_state: calls.append(mixer_state),
+        ),
+        audio_service=SimpleNamespace(
+            current_settings=AudioSettings(
+                1, 1, 48_000, routes, (0, 1)
+            )
         ),
     )
 
@@ -374,8 +401,9 @@ def test_audio_failure_stops_engine_and_disables_monitoring() -> None:
     assert events == ["stop", False, "summary", "Device busy"]
 
 
-def test_project_audio_settings_commit_after_stream_starts() -> None:
+def test_project_audio_settings_persist_globally_after_stream_starts() -> None:
     old_settings = AudioSettings(1, 1, 48_000)
+    global_settings = AudioSettings(1, 1, 96_000)
     new_settings = AudioSettings(
         1,
         1,
@@ -392,31 +420,39 @@ def test_project_audio_settings_commit_after_stream_starts() -> None:
     mixer_state.tracks[0].muted = True
     mixer_state.bus_level_db = -3.0
     view_events: list[object] = []
-    app = SimpleNamespace(
-        project=project,
-        audio_service=service,
-        audio_engine=engine,
-        mixer_state=mixer_state,
-        mixer_view=SimpleNamespace(
-            update_track_routes=lambda routes: view_events.append(routes),
-            set_monitoring_available=lambda available: view_events.append(
-                available
-            ),
+    saved_configs: list[AppConfig] = []
+    app = object.__new__(TapeMachine)
+    app.project = project
+    app.audio_service = service
+    app.audio_engine = engine
+    app.mixer_state = mixer_state
+    app.mixer_view = SimpleNamespace(
+        update_track_routes=lambda routes: view_events.append(routes),
+        set_monitoring_available=lambda available: view_events.append(
+            available
         ),
-        project_audio_error="old error",
-        audio_engine_error="old error",
-        _update_audio_summary=lambda: view_events.append("summary"),
     )
+    app.global_audio_settings = global_settings
+    app.app_config = AppConfig()
+    app.config_store = SimpleNamespace(save=saved_configs.append)
+    app.project_audio_error = "old error"
+    app.audio_engine_error = "old error"
+    app._update_audio_summary = lambda: view_events.append("summary")
 
     TapeMachine._project_audio_settings_applied(app, new_settings)
 
     assert engine.stop_calls == 1
     assert engine.starts == [new_settings]
-    assert project.saved[0].track_inputs == new_settings.track_inputs
-    assert project.saved[0].mix.tracks[0].level_db == -8.0
-    assert project.saved[0].mix.tracks[0].muted is True
-    assert project.saved[0].mix.bus_level_db == -3.0
-    assert project.saved[0].buffer_size == 256
+    assert project.saved == []
+    assert project.staged[-1].mix.tracks[0].level_db == -8.0
+    assert project.staged[-1].mix.tracks[0].muted is True
+    assert project.staged[-1].mix.bus_level_db == -3.0
+    assert saved_configs == [app.app_config]
+    assert app.app_config.audio_settings is not None
+    assert app.app_config.audio_settings.sample_rate == 96_000
+    assert app.app_config.audio_settings.buffer_size == 256
+    assert app.global_audio_settings.sample_rate == 96_000
+    assert app.global_audio_settings.track_inputs == new_settings.track_inputs
     assert service.current_settings == new_settings
     assert app.project_audio_error is None
     assert app.audio_engine_error is None
@@ -439,23 +475,25 @@ def test_project_audio_settings_clear_input_states_for_removed_route() -> None:
     state.tracks[0].record_enabled = True
     state.tracks[0].input_monitoring = True
     state.tracks[0].muted = True
-    app = SimpleNamespace(
-        project=project,
-        audio_service=service,
-        audio_engine=engine,
-        mixer_state=state,
-        mixer_view=SimpleNamespace(
-            update_track_routes=lambda routes: None,
-            set_monitoring_available=lambda available: None,
-        ),
-        project_audio_error=None,
-        audio_engine_error=None,
-        _update_audio_summary=lambda: None,
+    app = object.__new__(TapeMachine)
+    app.project = project
+    app.audio_service = service
+    app.audio_engine = engine
+    app.mixer_state = state
+    app.mixer_view = SimpleNamespace(
+        update_track_routes=lambda routes: None,
+        set_monitoring_available=lambda available: None,
     )
+    app.global_audio_settings = old_settings
+    app.app_config = AppConfig()
+    app.config_store = SimpleNamespace(save=lambda config: None)
+    app.project_audio_error = None
+    app.audio_engine_error = None
+    app._update_audio_summary = lambda: None
 
     TapeMachine._project_audio_settings_applied(app, new_settings)
 
-    saved_track = project.saved[0].mix.tracks[0]
+    saved_track = project.staged[-1].mix.tracks[0]
     assert saved_track.record_enabled is False
     assert saved_track.input_monitoring is False
     assert saved_track.muted is True
@@ -466,16 +504,19 @@ def test_saving_unchanged_project_settings_keeps_active_stream() -> None:
     service = FakeService(current_settings)
     engine = FakeLifecycleEngine()
     project = FakeProject()
-    app = SimpleNamespace(
-        project=project,
-        audio_service=service,
-        audio_engine=engine,
-        mixer_state=MixerState(),
-        mixer_view=None,
-        project_audio_error=None,
-        audio_engine_error=None,
-        _update_audio_summary=lambda: None,
-    )
+    saved_configs: list[AppConfig] = []
+    app = object.__new__(TapeMachine)
+    app.project = project
+    app.audio_service = service
+    app.audio_engine = engine
+    app.mixer_state = MixerState()
+    app.mixer_view = None
+    app.global_audio_settings = current_settings
+    app.app_config = AppConfig()
+    app.config_store = SimpleNamespace(save=saved_configs.append)
+    app.project_audio_error = None
+    app.audio_engine_error = None
+    app._update_audio_summary = lambda: None
 
     TapeMachine._project_audio_settings_applied(app, current_settings)
 
@@ -483,7 +524,7 @@ def test_saving_unchanged_project_settings_keeps_active_stream() -> None:
     assert service.validate_calls == 0
     assert engine.stop_calls == 0
     assert engine.starts == []
-    assert project.saved
+    assert saved_configs == [app.app_config]
 
 
 def test_failed_candidate_stream_keeps_project_metadata_and_old_settings() -> None:
@@ -493,23 +534,61 @@ def test_failed_candidate_stream_keeps_project_metadata_and_old_settings() -> No
     engine = FakeLifecycleEngine(fail_start=True)
     project = FakeProject()
     dialogs: list[str] = []
-    app = SimpleNamespace(
-        project=project,
-        audio_service=service,
-        audio_engine=engine,
-        mixer_state=MixerState(),
-        mixer_view=None,
-        _restore_audio_engine=lambda settings, was_running: True,
-        _set_audio_engine_failure=lambda message, show_dialog=False: None,
-        _schedule_audio_engine_dialog=lambda message: dialogs.append(message),
-    )
+    saved_configs: list[AppConfig] = []
+    app = object.__new__(TapeMachine)
+    app.project = project
+    app.audio_service = service
+    app.audio_engine = engine
+    app.mixer_state = MixerState()
+    app.mixer_view = None
+    app.global_audio_settings = old_settings
+    app.app_config = AppConfig()
+    app.config_store = SimpleNamespace(save=saved_configs.append)
+    app._restore_audio_engine = lambda settings, was_running: True
+    app._set_audio_engine_failure = lambda message, show_dialog=False: None
+    app._schedule_audio_engine_dialog = lambda message: dialogs.append(message)
 
     with pytest.raises(AudioEngineError, match="busy"):
         TapeMachine._project_audio_settings_applied(app, new_settings)
 
     assert project.saved == []
+    assert saved_configs == []
     assert service.current_settings == old_settings
     assert dialogs == ["Unable to start input monitoring: busy"]
+
+
+def test_failed_global_config_save_restores_project_stream_and_settings() -> None:
+    old_settings = AudioSettings(1, 1, 48_000)
+    global_settings = AudioSettings(1, 1, 96_000)
+    new_settings = AudioSettings(1, 1, 48_000, buffer_size=256)
+    service = FakeService(old_settings)
+    engine = FakeLifecycleEngine()
+    project = FakeProject()
+    original_config = AppConfig()
+    app = object.__new__(TapeMachine)
+    app.project = project
+    app.audio_service = service
+    app.audio_engine = engine
+    app.mixer_state = MixerState()
+    app.mixer_view = None
+    app.global_audio_settings = global_settings
+    app.app_config = original_config
+    app.config_store = SimpleNamespace(
+        save=lambda config: (_ for _ in ()).throw(RuntimeError("disk full"))
+    )
+    app.audio_engine_error = None
+    app._update_audio_summary = lambda: None
+    app._set_audio_engine_failure = lambda message: None
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        TapeMachine._project_audio_settings_applied(app, new_settings)
+
+    assert engine.starts == [new_settings, old_settings]
+    assert engine.running is True
+    assert service.current_settings == old_settings
+    assert app.global_audio_settings == global_settings
+    assert app.app_config is original_config
+    assert project.staged == []
 
 
 def test_project_commands_follow_open_project_state() -> None:
@@ -577,7 +656,7 @@ def test_window_position_is_clamped_to_an_attached_screen() -> None:
     assert _fit_window_position(None, (912, 560), screens) is None
 
 
-def test_audio_default_persistence_stores_all_selected_settings() -> None:
+def test_save_applies_and_persists_all_global_audio_settings() -> None:
     current = AudioSettings(1, 1, 48_000)
     candidate = AudioSettings(
         1, 1, 96_000, tuple(range(8)), (0, 1), 512
@@ -588,12 +667,19 @@ def test_audio_default_persistence_stores_all_selected_settings() -> None:
     app.audio_service = service
     app.app_config = AppConfig()
     app.config_store = SimpleNamespace(save=saved.append)
+    app.project = None
+    app.global_audio_settings = current
+    summaries: list[None] = []
+    app._update_audio_summary = lambda: summaries.append(None)
 
-    TapeMachine._save_audio_settings_as_default(app, candidate)
+    TapeMachine._audio_settings_applied(app, candidate)
 
-    assert service.current_settings is current
+    assert service.refresh_calls == 1
+    assert service.validate_calls == 1
+    assert service.current_settings == candidate
+    assert app.global_audio_settings == candidate
     assert saved == [app.app_config]
-    assert app.app_config.default_audio_settings == StoredAudioSettings(
+    assert app.app_config.audio_settings == StoredAudioSettings(
         input_device=service._input_device.reference,
         output_device=service._output_device.reference,
         sample_rate=96_000,
@@ -601,6 +687,30 @@ def test_audio_default_persistence_stores_all_selected_settings() -> None:
         bus_outputs=(0, 1),
         buffer_size=512,
     )
+    assert summaries == [None]
+
+
+def test_failed_global_config_save_does_not_apply_audio_settings() -> None:
+    current = AudioSettings(1, 1, 48_000)
+    candidate = AudioSettings(1, 1, 96_000, buffer_size=512)
+    service = FakeService(current)
+    original_config = AppConfig()
+    app = object.__new__(TapeMachine)
+    app.audio_service = service
+    app.app_config = original_config
+    app.config_store = SimpleNamespace(
+        save=lambda config: (_ for _ in ()).throw(RuntimeError("disk full"))
+    )
+    app.project = None
+    app.global_audio_settings = current
+    app._update_audio_summary = lambda: None
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        TapeMachine._audio_settings_applied(app, candidate)
+
+    assert service.current_settings == current
+    assert app.global_audio_settings == current
+    assert app.app_config is original_config
 
 
 def test_recent_files_are_persisted_and_menu_is_rebuilt(tmp_path: Path) -> None:
@@ -632,7 +742,7 @@ def test_window_positions_merge_with_existing_config() -> None:
     )
     saved: list[AppConfig] = []
     app = object.__new__(TapeMachine)
-    app.app_config = AppConfig(default_audio_settings=stored)
+    app.app_config = AppConfig(audio_settings=stored)
     app.config_store = SimpleNamespace(save=saved.append)
     app._main_window = SimpleNamespace(
         position=SimpleNamespace(x=120, y=80)
@@ -643,7 +753,7 @@ def test_window_positions_merge_with_existing_config() -> None:
 
     TapeMachine._save_window_positions(app)
 
-    assert app.app_config.default_audio_settings is stored
+    assert app.app_config.audio_settings is stored
     assert app.app_config.main_window_position == WindowPosition(120, 80)
     assert app.app_config.audio_settings_window_position == WindowPosition(-700, 140)
     assert saved == [app.app_config]

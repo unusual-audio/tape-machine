@@ -11,42 +11,41 @@ and multichannel project audio is stored with
 Open **Tape Machine → Settings…** or press <kbd>⌘</kbd><kbd>,</kbd> to select
 independent input and output devices, choose a supported studio sample rate and
 audio buffer size, and route input sources to eight project tracks. Buffer choices
-range from 32 to 2048 samples, plus **Automatic** for the device default. Smaller
+range from 16 to 2048 samples, plus **Automatic** for the device default. Smaller
 buffers reduce monitoring latency but increase the risk of audio dropouts. In
 addition to physical inputs, the
 matrix provides **Stereo bus L** and **Stereo bus R** as ordinary loopback inputs.
 Each track accepts one input, while the same input can feed multiple tracks. The
 stereo project bus can route its left and right sides to distinct physical outputs;
 either side may remain unassigned.
-On the initial screen this configuration is the template for new projects.
-Mappings are portable channel numbers: selecting an interface with fewer channels
+This configuration is global and applies to every project.
+Routing matrices show Core Audio channel names when the device provides them,
+falling back to numbered inputs and outputs for unnamed channels. Mappings remain
+portable channel numbers internally: selecting an interface with fewer channels
 does not erase them, and unavailable routes are shown as routing into the void.
 
-On the initial screen, **Save as Default** applies the complete dialog configuration
-to the current session and stores it as the template for the next app launch without
-closing Audio Settings. This includes both devices, the sample rate, all track-input
-routes, both stereo-bus outputs, and the buffer size. Project-specific Audio
-Settings continue to
-offer only **Save** and are written to the project rather than the app default.
+**Save** applies the complete dialog configuration and stores it for the next app
+launch. This includes both devices, the sample rate, all track-input routes, both
+stereo-bus outputs, and the buffer size.
 
 ## Projects
 
 Choose **File → New Project** or press <kbd>⌘N</kbd> to create an empty
 eight-channel, 24-bit PCM RF64/WAV file at the currently selected sample rate.
 **File → Open Project…** (<kbd>⌘O</kbd>) accepts eight-channel WAV, WAVEX, and
-RF64 files. Tape Machine stores versioned project configuration in the WAV comment
-metadata, including preferred input and output devices, both routing matrices,
-and the complete mixer state. Untagged eight-channel WAV files can be imported
-and tagged when saved.
+RF64 files. Tape Machine stores the complete mixer state as versioned project
+configuration in the WAV comment metadata. Audio devices, routing, and buffer size
+remain global and are never written to a project. Untagged eight-channel WAV files
+can be imported and tagged when saved.
 
 **File → Open Recent** keeps the ten most recently created or opened projects.
 Selecting a missing file removes it from the menu, and **Clear Menu** removes the
 entire history.
 
-The WAV header owns the project sample rate. While a project is open the rate is
-read-only, and Audio Settings are saved directly into the project file. Use
-**File → Save Project** (<kbd>⌘S</kbd>) and **File → Close Project**
-(<kbd>⌘W</kbd>) to manage the open file.
+The WAV header owns the project sample rate. While a project is open, that rate is
+used temporarily and is read-only in Audio Settings; the saved global sample rate
+continues to be used for new projects. Use **File → Save Project** (<kbd>⌘S</kbd>)
+and **File → Close Project** (<kbd>⌘W</kbd>) to manage the open file.
 
 The project screen presents eight track strips and a stereo-bus strip. Each track
 has a vertical −∞ to +6 dB fader, a pan knob, and record, input-monitor, mute,
@@ -86,13 +85,13 @@ Record and punch workflow; it has no separate bounce mode.
 
 ## Application configuration
 
-Recent projects, default Audio Settings, and the last positions of the main and
+Recent projects, global Audio Settings, and the last positions of the main and
 Audio Settings windows are stored separately from project WAV metadata. On macOS,
 the versioned JSON file is located at
 `~/Library/Preferences/pkg.unusualaudio.tape-machine/config.json`. If a saved
 window is no longer on a connected display, it is moved onto the primary display.
 If saved audio hardware is unavailable, Tape Machine uses a compatible session
-fallback without overwriting the saved default.
+fallback without overwriting the saved configuration.
 
 ## Development
 

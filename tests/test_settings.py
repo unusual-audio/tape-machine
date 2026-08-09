@@ -21,6 +21,7 @@ from tape_machine.settings import (
     AudioSettingsWindow,
     BufferSizeChoice,
     DeviceChoice,
+    device_channel_labels,
     input_source_rows,
 )
 
@@ -128,6 +129,75 @@ def test_input_matrix_rows_end_with_stereo_bus_loopbacks() -> None:
     )
 
 
+def test_channel_labels_use_names_and_disambiguate_duplicates() -> None:
+    device = AudioDevice(
+        1,
+        "Interface",
+        "Core Audio",
+        4,
+        3,
+        48_000,
+        input_channel_names=(" Mic ", "mic", "Instrument", None),
+        output_channel_names=("Monitor", None, "Phones"),
+    )
+
+    assert device_channel_labels(device, "input") == (
+        "Mic (Input 1)",
+        "mic (Input 2)",
+        "Instrument",
+        "Input 4",
+    )
+    assert device_channel_labels(device, "output") == (
+        "Monitor",
+        "Output 2",
+        "Phones",
+    )
+
+
+def test_channel_labels_mark_saved_routes_beyond_device_as_unavailable() -> None:
+    device = AudioDevice(
+        1,
+        "Interface",
+        "Core Audio",
+        1,
+        1,
+        48_000,
+        input_channel_names=("Mic",),
+        output_channel_names=("Monitor",),
+    )
+
+    assert device_channel_labels(device, "input", 3) == (
+        "Mic",
+        "Input 2 (unavailable)",
+        "Input 3 (unavailable)",
+    )
+    assert device_channel_labels(device, "output", 2) == (
+        "Monitor",
+        "Output 2 (unavailable)",
+    )
+
+
+def test_input_rows_use_native_names_before_stereo_bus_loopbacks() -> None:
+    input_device = AudioDevice(
+        1,
+        "Input",
+        "Core Audio",
+        2,
+        0,
+        48_000,
+        input_channel_names=("Mic", "Instrument"),
+    )
+
+    rows = input_source_rows(input_device, UNASSIGNED_TRACK_INPUTS)
+
+    assert rows == (
+        (0, "Mic"),
+        (1, "Instrument"),
+        (StereoBusInput.LEFT, "Stereo bus L"),
+        (StereoBusInput.RIGHT, "Stereo bus R"),
+    )
+
+
 def test_selecting_another_output_replaces_the_bus_side() -> None:
     window, rate_updates = output_routing_window((0, None))
     previous = FakeSwitch(True)
@@ -225,7 +295,6 @@ def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
         value=BufferSizeChoice(256)
     )
     window.save_button = SimpleNamespace(enabled=False)
-    window.save_as_default_button = SimpleNamespace(enabled=False)
     window.status_label = SimpleNamespace(text="")
     window.service = SimpleNamespace(
         compatibility_error=lambda candidate: compatibility_calls.append(
@@ -237,19 +306,18 @@ def test_locked_rate_does_not_reprobe_the_active_configuration() -> None:
 
     assert compatibility_calls == []
     assert window.save_button.enabled is True
-    assert window.save_as_default_button.enabled is True
     assert window.status_label.text == (
         "Project sample rate is fixed by the WAV file."
     )
 
 
-def test_save_as_default_applies_and_persists_without_closing() -> None:
+def test_save_applies_settings_and_closes() -> None:
     input_device = AudioDevice(1, "Input", "Core Audio", 8, 0, 48_000)
     output_device = AudioDevice(2, "Output", "Core Audio", 0, 2, 48_000)
     settings = AudioSettings(
         1, 2, 48_000, (0,) + (None,) * 7, (0, 1), 512
     )
-    events: list[tuple[str, AudioSettings]] = []
+    events: list[AudioSettings] = []
     hides: list[None] = []
     window = AudioSettingsWindow.__new__(AudioSettingsWindow)
     window.input_selection = SimpleNamespace(
@@ -265,17 +333,14 @@ def test_save_as_default_applies_and_persists_without_closing() -> None:
         value=BufferSizeChoice(512)
     )
     window.save_button = SimpleNamespace(enabled=True)
-    window.save_as_default_button = SimpleNamespace(enabled=True)
     window.status_label = SimpleNamespace(text="")
-    window.on_applied = lambda value: events.append(("applied", value))
-    window.on_save_as_default = lambda value: events.append(("saved", value))
+    window.on_applied = events.append
     window.window = SimpleNamespace(hide=lambda: hides.append(None))
 
-    window._save_as_default(SimpleNamespace())
+    window._save(SimpleNamespace())
 
-    assert events == [("applied", settings), ("saved", settings)]
-    assert hides == []
-    assert window.status_label.text == "Applied and saved as default."
+    assert events == [settings]
+    assert hides == [None]
 
 
 def test_buffer_size_choices_show_samples_and_automatic() -> None:
@@ -298,31 +363,10 @@ def test_buffer_size_selection_round_trips_standard_choices(
     ).buffer_size == buffer_size
 
 
-def test_save_as_default_button_visibility_tracks_settings_context() -> None:
-    inserted: list[tuple[int, object]] = []
-    removed: list[object] = []
-    window = AudioSettingsWindow.__new__(AudioSettingsWindow)
-    window._save_as_default_visible = False
-    window.save_as_default_button = object()
-    window.button_row = SimpleNamespace(
-        insert=lambda index, button: inserted.append((index, button)),
-        remove=removed.append,
-    )
-
-    window._set_save_as_default_visible(True)
-    window._set_save_as_default_visible(True)
-    window._set_save_as_default_visible(False)
-
-    assert inserted == [(1, window.save_as_default_button)]
-    assert removed == [window.save_as_default_button]
-
-
-def test_visible_settings_window_updates_save_default_context() -> None:
-    visibility_updates: list[bool] = []
+def test_open_leaves_an_already_visible_draft_intact() -> None:
     window = AudioSettingsWindow.__new__(AudioSettingsWindow)
     window.window = SimpleNamespace(visible=True)
-    window._set_save_as_default_visible = visibility_updates.append
 
-    window.open(allow_save_as_default=False)
+    window.open()
 
-    assert visibility_updates == [False]
+    assert window.window.visible is True
