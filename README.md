@@ -14,6 +14,8 @@ and shows recent projects for one-click access.
 
 ## Audio settings
 
+<img alt="Screenshot" src="https://github.com/user-attachments/assets/9a0d9f26-5ecb-423c-9ec4-927daf6b35fd" />
+
 Open **Tape Machine → Settings…** or press <kbd>⌘</kbd><kbd>,</kbd> to select
 independent input and output devices, choose a supported studio sample rate and
 audio buffer size, and route input sources to eight project tracks. Buffer choices
