@@ -1037,11 +1037,20 @@ class TapeMachine(toga.App):
         try:
             while self.transport is transport and transport is not None:
                 self._sync_transport_controls()
+                self._sync_meters()
                 if transport.running and transport.end_requested:
                     await self._stop_transport()
                 await asyncio.sleep(1 / 30)
         except asyncio.CancelledError:
             pass
+
+    def _sync_meters(self) -> None:
+        if self.mixer_view is None:
+            return
+        snapshot = self.audio_engine.meter_snapshot
+        self.mixer_view.set_meter_levels(
+            snapshot.track_db, snapshot.bus_db
+        )
 
     def _sync_transport_controls(self) -> None:
         if self.transport is None or not hasattr(

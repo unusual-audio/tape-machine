@@ -1,5 +1,7 @@
 """Tests for the session-only project mixer."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from tape_machine.audio import StereoBusInput
@@ -11,8 +13,10 @@ from tape_machine.mixer import (
     PanKnob,
     VerticalFader,
     format_level_db,
+    level_y,
 )
 from tape_machine.project import MixerMetadata, TrackMixMetadata
+from tape_machine.theme import METER_GREEN, METER_OFF, METER_RED, METER_YELLOW
 
 
 def test_mixer_defaults_to_unity_centered_and_inactive() -> None:
@@ -179,6 +183,70 @@ def test_fader_coordinates_cover_the_level_range() -> None:
     assert VerticalFader.value_from_y(214) == pytest.approx(MIN_LEVEL_DB)
     assert VerticalFader.value_from_y(-20) == pytest.approx(MAX_LEVEL_DB)
     assert VerticalFader.value_from_y(300) == pytest.approx(MIN_LEVEL_DB)
+    assert level_y(MIN_LEVEL_DB) == pytest.approx(214)
+    assert level_y(0) == pytest.approx(30.363636)
+    assert level_y(MAX_LEVEL_DB) == pytest.approx(12)
+
+
+def test_fader_meter_clamps_levels_and_redraws_only_for_changes() -> None:
+    redraws: list[object] = []
+    fader = VerticalFader.__new__(VerticalFader)
+    fader.meter_channels = 2
+    fader.meter_levels = (MIN_LEVEL_DB, MIN_LEVEL_DB)
+    fader.canvas = object()
+    fader._draw = lambda canvas: redraws.append(canvas)
+
+    fader.set_meter_levels((-80.0, 4.0))
+    fader.set_meter_levels((-80.0, 4.0))
+
+    assert fader.meter_levels == (MIN_LEVEL_DB, 0.0)
+    assert redraws == [fader.canvas]
+    with pytest.raises(ValueError, match="requires 2"):
+        fader.set_meter_levels((-6.0,))
+
+
+def test_meter_draws_green_yellow_and_red_threshold_segments() -> None:
+    class FillContext:
+        def __init__(self, canvas: "FakeCanvas", color: str) -> None:
+            self.canvas = canvas
+            self.color = color
+
+        def __enter__(self) -> None:
+            self.canvas.color = self.color
+
+        def __exit__(self, *args: object) -> None:
+            self.canvas.color = None
+
+    class FakeCanvas:
+        def __init__(self) -> None:
+            self.color: str | None = None
+            self.rectangles: list[tuple[str | None, float]] = []
+
+        def fill(self, *, color: str) -> FillContext:
+            return FillContext(self, color)
+
+        def rect(
+            self, x: float, y: float, width: float, height: float
+        ) -> None:
+            self.rectangles.append((self.color, height))
+
+    yellow_canvas = FakeCanvas()
+    VerticalFader._draw_meter(yellow_canvas, 0, 5, -6)
+    assert [color for color, _ in yellow_canvas.rectangles] == [
+        METER_OFF,
+        METER_GREEN,
+        METER_YELLOW,
+    ]
+
+    red_canvas = FakeCanvas()
+    VerticalFader._draw_meter(red_canvas, 0, 5, -1)
+    assert [color for color, _ in red_canvas.rectangles] == [
+        METER_OFF,
+        METER_GREEN,
+        METER_YELLOW,
+        METER_RED,
+    ]
+    assert all(height > 0 for _, height in red_canvas.rectangles)
 
 
 def test_pan_vertical_drag_and_level_readouts() -> None:
@@ -273,3 +341,28 @@ def test_unavailable_monitoring_preserves_saved_monitor_state() -> None:
 
     assert all(strip.monitoring_available is False for strip in strips)
     assert state.tracks[0].input_monitoring is True
+
+
+def test_mixer_view_distributes_track_and_stereo_bus_meter_levels() -> None:
+    received: list[tuple[float, ...]] = []
+
+    def fader() -> SimpleNamespace:
+        return SimpleNamespace(
+            set_meter_levels=lambda levels: received.append(levels)
+        )
+
+    view = MixerView.__new__(MixerView)
+    view.track_strips = [
+        SimpleNamespace(fader=fader()) for _ in range(8)
+    ]
+    view.bus_strip = SimpleNamespace(fader=fader())
+    track_levels = tuple(-float(index) for index in range(8))
+
+    view.set_meter_levels(track_levels, (-9.0, -12.0))
+
+    assert received == [
+        *((level,) for level in track_levels),
+        (-9.0, -12.0),
+    ]
+    with pytest.raises(ValueError, match="8 tracks"):
+        view.set_meter_levels((-1.0,), (-2.0, -3.0))

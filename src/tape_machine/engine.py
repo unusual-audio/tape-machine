@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from math import sqrt
+from dataclasses import dataclass
+from math import log10, sqrt
 from time import sleep
 from typing import Any, Callable, Protocol
 
@@ -14,6 +15,7 @@ from tape_machine.audio import (
     STEREO_BUS_CHANNEL_COUNT,
     AudioDevice,
     AudioSettings,
+    StereoBusInput,
     is_physical_input,
 )
 from tape_machine.mixer import MIN_LEVEL_DB, MixerState
@@ -41,6 +43,12 @@ class AudioStreamBackend(Protocol):
     def RawStream(self, **kwargs: Any) -> AudioStream: ...
 
 
+class CaptureAudioContext(Protocol):
+    """Recording state returned for one callback audio block."""
+
+    armed_tracks: tuple[bool, ...]
+
+
 class TransportAudioSource(Protocol):
     """Real-time transport interface consumed by the stream callback."""
 
@@ -49,7 +57,7 @@ class TransportAudioSource(Protocol):
         frames: int,
         status: object,
         destination: np.ndarray | None = None,
-    ) -> tuple[np.ndarray | None, object | None]: ...
+    ) -> tuple[np.ndarray | None, CaptureAudioContext | None]: ...
 
     def submit_capture(
         self,
@@ -57,6 +65,28 @@ class TransportAudioSource(Protocol):
         input_data: np.ndarray,
         stereo_bus: np.ndarray,
     ) -> None: ...
+
+
+METER_FLOOR_DB = -60.0
+METER_CEILING_DB = 0.0
+METER_FALL_DB_PER_SECOND = 20.0
+_METER_VALUE_COUNT = PROJECT_TRACK_COUNT + STEREO_BUS_CHANNEL_COUNT
+_NO_RECORDING_TRACKS = (False,) * PROJECT_TRACK_COUNT
+
+
+@dataclass(frozen=True, slots=True)
+class MeterSnapshot:
+    """Coherent UI-facing track and stereo-bus peak levels in dBFS."""
+
+    track_db: tuple[float, ...]
+    bus_db: tuple[float, float]
+
+
+def _silent_meter_snapshot() -> MeterSnapshot:
+    return MeterSnapshot(
+        (METER_FLOOR_DB,) * PROJECT_TRACK_COUNT,
+        (METER_FLOOR_DB,) * STEREO_BUS_CHANNEL_COUNT,
+    )
 
 
 def db_to_gain(value: float) -> float:
@@ -107,13 +137,20 @@ def build_monitor_bus_matrix(
     input_channels: int,
 ) -> np.ndarray:
     """Build the device-input-to-internal-stereo-bus monitoring matrix."""
+    return build_monitor_pre_bus_matrix(
+        settings, mixer_state, input_channels
+    ) * db_to_gain(mixer_state.bus_level_db)
+
+
+def build_monitor_pre_bus_matrix(
+    settings: AudioSettings,
+    mixer_state: MixerState,
+    input_channels: int,
+) -> np.ndarray:
+    """Build monitoring gains before the stereo-bus fader."""
     matrix = np.zeros(
         (input_channels, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
     )
-    bus_gain = db_to_gain(mixer_state.bus_level_db)
-    if bus_gain == 0.0:
-        return matrix
-
     any_solo = any(track.soloed for track in mixer_state.tracks)
     for track, input_channel in zip(
         mixer_state.tracks, settings.track_inputs, strict=True
@@ -127,7 +164,7 @@ def build_monitor_bus_matrix(
         ):
             continue
 
-        track_gain = db_to_gain(track.level_db) * bus_gain
+        track_gain = db_to_gain(track.level_db)
         if track_gain == 0.0:
             continue
         pan = max(-1.0, min(1.0, track.pan))
@@ -151,19 +188,22 @@ def build_playback_matrix(
 
 def build_playback_bus_matrix(mixer_state: MixerState) -> np.ndarray:
     """Build the project-track-to-internal-stereo-bus playback matrix."""
+    return build_playback_pre_bus_matrix(mixer_state) * db_to_gain(
+        mixer_state.bus_level_db
+    )
+
+
+def build_playback_pre_bus_matrix(mixer_state: MixerState) -> np.ndarray:
+    """Build project-track gains before the stereo-bus fader."""
     matrix = np.zeros(
         (len(mixer_state.tracks), STEREO_BUS_CHANNEL_COUNT),
         dtype=np.float32,
     )
-    bus_gain = db_to_gain(mixer_state.bus_level_db)
-    if bus_gain == 0.0:
-        return matrix
-
     any_solo = any(track.soloed for track in mixer_state.tracks)
     for track_index, track in enumerate(mixer_state.tracks):
         if track.muted or (any_solo and not track.soloed):
             continue
-        track_gain = db_to_gain(track.level_db) * bus_gain
+        track_gain = db_to_gain(track.level_db)
         pan = max(-1.0, min(1.0, track.pan))
         matrix[track_index, 0] = sqrt((1.0 - pan) / 2.0) * track_gain
         matrix[track_index, 1] = sqrt((1.0 + pan) / 2.0) * track_gain
@@ -197,10 +237,16 @@ class AudioEngine:
         self._settings: AudioSettings | None = None
         self._input_channels = 1
         self._output_channels = 1
-        self._monitor_bus_matrix = np.zeros((1, 2), dtype=np.float32)
-        self._playback_bus_matrix = np.zeros((8, 2), dtype=np.float32)
+        self._mix_snapshot = (
+            np.zeros((1, 2), dtype=np.float32),
+            np.zeros((8, 2), dtype=np.float32),
+            0.0,
+        )
         self._bus_output_matrix = np.zeros((2, 1), dtype=np.float32)
         self._transport: TransportAudioSource | None = None
+        self._pre_bus_scratch = np.zeros(
+            (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
         self._stereo_bus_scratch = np.zeros(
             (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
         )
@@ -210,6 +256,13 @@ class AudioEngine:
         self._track_playback_scratch = np.zeros(
             (0, PROJECT_TRACK_COUNT), dtype=np.float32
         )
+        self._meter_abs_scratch = np.zeros(0, dtype=np.float32)
+        self._meter_peak_scratch = np.zeros((), dtype=np.float32)
+        self._meter_levels_db = np.full(
+            _METER_VALUE_COUNT, METER_FLOOR_DB, dtype=np.float32
+        )
+        self._meter_generation = 0
+        self._meter_ui_snapshot = _silent_meter_snapshot()
 
     @property
     def running(self) -> bool:
@@ -218,6 +271,25 @@ class AudioEngine:
     @property
     def settings(self) -> AudioSettings | None:
         return self._settings
+
+    @property
+    def meter_snapshot(self) -> MeterSnapshot:
+        """Return the latest coherent callback meter envelope."""
+        generation = self._meter_generation
+        if generation % 2:
+            return self._meter_ui_snapshot
+        values = self._meter_levels_db
+        snapshot = MeterSnapshot(
+            tuple(float(value) for value in values[:PROJECT_TRACK_COUNT]),
+            (
+                float(values[PROJECT_TRACK_COUNT]),
+                float(values[PROJECT_TRACK_COUNT + 1]),
+            ),
+        )
+        if generation != self._meter_generation:
+            return self._meter_ui_snapshot
+        self._meter_ui_snapshot = snapshot
+        return snapshot
 
     def start(
         self,
@@ -234,10 +306,11 @@ class AudioEngine:
         input_channels, output_channels = stream_channel_counts(
             settings, input_device, output_device
         )
-        monitor_bus_matrix = build_monitor_bus_matrix(
+        monitor_bus_matrix = build_monitor_pre_bus_matrix(
             settings, mixer_state, input_channels
         )
-        playback_bus_matrix = build_playback_bus_matrix(mixer_state)
+        playback_bus_matrix = build_playback_pre_bus_matrix(mixer_state)
+        bus_gain = db_to_gain(mixer_state.bus_level_db)
         bus_output_matrix = build_bus_output_matrix(
             settings, output_channels
         )
@@ -261,8 +334,11 @@ class AudioEngine:
                 self._settings = settings
                 self._input_channels = input_channels
                 self._output_channels = output_channels
-                self._monitor_bus_matrix = monitor_bus_matrix
-                self._playback_bus_matrix = playback_bus_matrix
+                self._mix_snapshot = (
+                    monitor_bus_matrix,
+                    playback_bus_matrix,
+                    bus_gain,
+                )
                 self._bus_output_matrix = bus_output_matrix
                 self._stream = stream
                 stream.start()
@@ -283,10 +359,14 @@ class AudioEngine:
         failed_stream = self._stream
         self._stream = None
         self._settings = None
-        self._monitor_bus_matrix = np.zeros((1, 2), dtype=np.float32)
-        self._playback_bus_matrix = np.zeros((8, 2), dtype=np.float32)
+        self._mix_snapshot = (
+            np.zeros((1, 2), dtype=np.float32),
+            np.zeros((8, 2), dtype=np.float32),
+            0.0,
+        )
         self._bus_output_matrix = np.zeros((2, 1), dtype=np.float32)
         self._reset_audio_scratch()
+        self._reset_meter_levels()
         if failed_stream is not None:
             try:
                 failed_stream.close()
@@ -307,12 +387,15 @@ class AudioEngine:
         """Atomically replace the matrix consumed by the callback."""
         if self._settings is None:
             return
-        self._monitor_bus_matrix = build_monitor_bus_matrix(
-            self._settings,
-            mixer_state,
-            self._input_channels,
+        self._mix_snapshot = (
+            build_monitor_pre_bus_matrix(
+                self._settings,
+                mixer_state,
+                self._input_channels,
+            ),
+            build_playback_pre_bus_matrix(mixer_state),
+            db_to_gain(mixer_state.bus_level_db),
         )
-        self._playback_bus_matrix = build_playback_bus_matrix(mixer_state)
 
     def set_transport(self, transport: TransportAudioSource | None) -> None:
         """Attach the project transport consumed by future callbacks."""
@@ -323,11 +406,15 @@ class AudioEngine:
         stream = self._stream
         self._stream = None
         self._settings = None
-        self._monitor_bus_matrix = np.zeros((1, 2), dtype=np.float32)
-        self._playback_bus_matrix = np.zeros((8, 2), dtype=np.float32)
+        self._mix_snapshot = (
+            np.zeros((1, 2), dtype=np.float32),
+            np.zeros((8, 2), dtype=np.float32),
+            0.0,
+        )
         self._bus_output_matrix = np.zeros((2, 1), dtype=np.float32)
         self._reset_audio_scratch()
         if stream is None:
+            self._reset_meter_levels()
             return
         try:
             if stream.active:
@@ -338,6 +425,7 @@ class AudioEngine:
             stream.close()
         except Exception:
             pass
+        self._reset_meter_levels()
 
     def _callback(
         self,
@@ -354,24 +442,27 @@ class AudioEngine:
         outdata = np.frombuffer(output_buffer, dtype=np.float32).reshape(
             frames, self._output_channels
         )
-        monitor_bus_matrix = self._monitor_bus_matrix
-        stereo_bus, playback_bus, track_playback = self._audio_scratch(
-            frames
-        )
-        stereo_bus.fill(0)
+        monitor_bus_matrix, playback_bus_matrix, bus_gain = self._mix_snapshot
+        (
+            pre_bus,
+            stereo_bus,
+            playback_bus,
+            track_playback,
+        ) = self._audio_scratch(frames)
+        pre_bus.fill(0)
         outdata.fill(0)
         if monitor_bus_matrix.shape == (
             indata.shape[1],
             STEREO_BUS_CHANNEL_COUNT,
         ):
-            np.matmul(indata, monitor_bus_matrix, out=stereo_bus)
+            np.matmul(indata, monitor_bus_matrix, out=pre_bus)
         transport = self._transport
-        capture_context: object | None = None
+        playback: np.ndarray | None = None
+        capture_context: CaptureAudioContext | None = None
         if transport is not None:
             playback, capture_context = transport.prepare_audio(
                 frames, status, track_playback
             )
-            playback_bus_matrix = self._playback_bus_matrix
             if (
                 playback is not None
                 and playback.shape[1] == playback_bus_matrix.shape[0]
@@ -379,8 +470,17 @@ class AudioEngine:
                 np.matmul(
                     playback, playback_bus_matrix, out=playback_bus
                 )
-                stereo_bus += playback_bus
+                pre_bus += playback_bus
+        np.multiply(pre_bus, bus_gain, out=stereo_bus)
         np.clip(stereo_bus, -1.0, 1.0, out=stereo_bus)
+        self._update_meter_levels(
+            indata,
+            playback,
+            capture_context,
+            pre_bus,
+            stereo_bus,
+            frames,
+        )
         bus_output_matrix = self._bus_output_matrix
         if bus_output_matrix.shape == (
             STEREO_BUS_CHANNEL_COUNT,
@@ -393,9 +493,12 @@ class AudioEngine:
 
     def _audio_scratch(
         self, frames: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return reusable callback buffers sized for the current block."""
         if len(self._stereo_bus_scratch) < frames:
+            self._pre_bus_scratch = np.zeros(
+                (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+            )
             self._stereo_bus_scratch = np.zeros(
                 (frames, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
             )
@@ -405,13 +508,105 @@ class AudioEngine:
             self._track_playback_scratch = np.zeros(
                 (frames, PROJECT_TRACK_COUNT), dtype=np.float32
             )
+            self._meter_abs_scratch = np.zeros(frames, dtype=np.float32)
         return (
+            self._pre_bus_scratch[:frames],
             self._stereo_bus_scratch[:frames],
             self._playback_bus_scratch[:frames],
             self._track_playback_scratch[:frames],
         )
 
+    def _update_meter_levels(
+        self,
+        indata: np.ndarray,
+        playback: np.ndarray | None,
+        capture_context: CaptureAudioContext | None,
+        pre_bus: np.ndarray,
+        stereo_bus: np.ndarray,
+        frames: int,
+    ) -> None:
+        """Publish source-aware peaks with immediate attack and smooth fall."""
+        settings = self._settings
+        if settings is None:
+            return
+        recording_tracks = getattr(
+            capture_context, "armed_tracks", _NO_RECORDING_TRACKS
+        )
+        if len(recording_tracks) != PROJECT_TRACK_COUNT:
+            recording_tracks = _NO_RECORDING_TRACKS
+        decay_db = (
+            METER_FALL_DB_PER_SECOND * frames / settings.sample_rate
+        )
+
+        self._meter_generation += 1
+        try:
+            for track_index, route in enumerate(settings.track_inputs):
+                use_input = playback is None or recording_tracks[track_index]
+                source: np.ndarray | None
+                if not use_input:
+                    source = (
+                        playback[:, track_index]
+                        if playback is not None
+                        and playback.shape[1] > track_index
+                        else None
+                    )
+                elif (
+                    is_physical_input(route)
+                    and route < indata.shape[1]
+                ):
+                    source = indata[:, route]
+                elif route is StereoBusInput.LEFT:
+                    source = stereo_bus[:, 0]
+                elif route is StereoBusInput.RIGHT:
+                    source = stereo_bus[:, 1]
+                else:
+                    source = None
+                self._update_meter_channel(
+                    track_index, source, decay_db
+                )
+
+            for bus_channel in range(STEREO_BUS_CHANNEL_COUNT):
+                self._update_meter_channel(
+                    PROJECT_TRACK_COUNT + bus_channel,
+                    pre_bus[:, bus_channel],
+                    decay_db,
+                )
+        finally:
+            self._meter_generation += 1
+
+    def _update_meter_channel(
+        self,
+        meter_index: int,
+        source: np.ndarray | None,
+        decay_db: float,
+    ) -> None:
+        target_db = METER_FLOOR_DB
+        if source is not None and len(source):
+            absolute = self._meter_abs_scratch[: len(source)]
+            np.abs(source, out=absolute)
+            np.max(absolute, out=self._meter_peak_scratch)
+            peak = float(self._meter_peak_scratch)
+            if peak > 0.0:
+                target_db = max(
+                    METER_FLOOR_DB,
+                    min(METER_CEILING_DB, 20.0 * log10(peak)),
+                )
+        falling_db = max(
+            METER_FLOOR_DB,
+            float(self._meter_levels_db[meter_index]) - decay_db,
+        )
+        self._meter_levels_db[meter_index] = max(target_db, falling_db)
+
+    def _reset_meter_levels(self) -> None:
+        self._meter_generation += 1
+        self._meter_levels_db.fill(METER_FLOOR_DB)
+        self._meter_generation += 1
+        self._meter_ui_snapshot = _silent_meter_snapshot()
+
     def _reset_audio_scratch(self) -> None:
+        self._pre_bus_scratch = np.zeros(
+            (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
+        )
         self._stereo_bus_scratch = np.zeros(
             (0, STEREO_BUS_CHANNEL_COUNT), dtype=np.float32
         )
@@ -421,6 +616,7 @@ class AudioEngine:
         self._track_playback_scratch = np.zeros(
             (0, PROJECT_TRACK_COUNT), dtype=np.float32
         )
+        self._meter_abs_scratch = np.zeros(0, dtype=np.float32)
 
 
 def _is_transient_core_audio_error(exc: Exception) -> bool:

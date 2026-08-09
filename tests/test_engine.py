@@ -17,9 +17,11 @@ from tape_machine.audio import (
     TrackInputRoute,
 )
 from tape_machine.engine import (
+    METER_FLOOR_DB,
     AudioEngine,
     AudioEngineError,
     build_monitor_matrix,
+    build_monitor_pre_bus_matrix,
     build_playback_matrix,
     db_to_gain,
     stream_channel_counts,
@@ -104,6 +106,10 @@ def monitored_state(*inputs: int | None) -> MixerState:
     for index, channel in enumerate(inputs):
         state.tracks[index].input_monitoring = channel is not None
     return state
+
+
+def peak_db(amplitude: float) -> float:
+    return 20.0 * np.log10(amplitude)
 
 
 def test_stream_uses_low_latency_adaptive_duplex_configuration() -> None:
@@ -242,6 +248,17 @@ def test_track_and_bus_faders_apply_amplitude_gain() -> None:
     assert not build_monitor_matrix(settings(), state, 1, 2).any()
 
 
+def test_pre_bus_matrix_excludes_the_stereo_bus_fader() -> None:
+    state = monitored_state(0)
+    state.tracks[0].pan = -1
+    state.bus_level_db = MIN_LEVEL_DB
+
+    assert build_monitor_pre_bus_matrix(settings(), state, 1)[0] == (
+        pytest.approx([1, 0])
+    )
+    assert not build_monitor_matrix(settings(), state, 1, 2).any()
+
+
 def test_mute_and_solo_gate_monitored_tracks() -> None:
     audio_settings = settings(
         track_inputs=(0, 1, None, None, None, None, None, None)
@@ -307,6 +324,241 @@ def test_callback_renders_current_matrix_and_clips_final_output() -> None:
     callback(indata, outdata, 2, None, None)
     assert outdata[:, 0] == pytest.approx([0, 0])
     assert outdata[:, 1] == pytest.approx([0.25 * db_to_gain(6), 1.0])
+
+
+def test_stopped_meters_show_inputs_independent_of_track_controls() -> None:
+    routes = (0, 0, StereoBusInput.LEFT) + (None,) * 5
+    audio_settings = settings(track_inputs=routes)
+    state = MixerState.from_track_inputs(routes)
+    state.tracks[0].input_monitoring = True
+    state.tracks[0].pan = -1
+    state.tracks[1].record_enabled = True
+    state.tracks[1].input_monitoring = False
+    state.tracks[1].muted = True
+    state.tracks[1].level_db = MIN_LEVEL_DB
+    state.bus_level_db = -6
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.start(
+        audio_settings,
+        state,
+        device(inputs=1, index=1),
+        device(outputs=2, index=2),
+    )
+    callback = backend.streams[0].kwargs["callback"]
+    indata = np.full((4, 1), 0.5, dtype=np.float32)
+    outdata = np.zeros((4, 2), dtype=np.float32)
+
+    callback(indata, outdata, 4, None, None)
+    snapshot = engine.meter_snapshot
+
+    assert snapshot.track_db[0] == pytest.approx(peak_db(0.5))
+    assert snapshot.track_db[1] == pytest.approx(peak_db(0.5))
+    assert snapshot.track_db[2] == pytest.approx(
+        peak_db(0.5 * db_to_gain(-6)), abs=1e-5
+    )
+    assert snapshot.bus_db[0] == pytest.approx(peak_db(0.5))
+    assert snapshot.bus_db[1] == METER_FLOOR_DB
+    assert outdata[:, 0] == pytest.approx(
+        [0.5 * db_to_gain(-6)] * 4
+    )
+
+
+def test_playback_meters_show_tape_instead_of_live_inputs() -> None:
+    class PlaybackTransport:
+        def prepare_audio(
+            self,
+            frames: int,
+            status: object,
+            destination: np.ndarray | None = None,
+        ) -> tuple[np.ndarray, None]:
+            assert destination is not None
+            destination.fill(0)
+            destination[:, 0] = 0.25
+            destination[:, 1] = 0.125
+            return destination, None
+
+        def submit_capture(
+            self,
+            context: object,
+            input_data: np.ndarray,
+            stereo_bus: np.ndarray,
+        ) -> None:
+            raise AssertionError("playback did not request capture")
+
+    routes = (0, 1) + (None,) * 6
+    state = MixerState.from_track_inputs(routes)
+    state.tracks[0].muted = True
+    state.tracks[1].level_db = MIN_LEVEL_DB
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.set_transport(PlaybackTransport())
+    engine.start(
+        settings(track_inputs=routes),
+        state,
+        device(inputs=2, index=1),
+        device(outputs=2, index=2),
+    )
+    callback = backend.streams[0].kwargs["callback"]
+
+    callback(
+        np.full((4, 2), 0.9, dtype=np.float32),
+        np.zeros((4, 2), dtype=np.float32),
+        4,
+        None,
+        None,
+    )
+    snapshot = engine.meter_snapshot
+
+    assert snapshot.track_db[0] == pytest.approx(peak_db(0.25))
+    assert snapshot.track_db[1] == pytest.approx(peak_db(0.125))
+
+
+def test_recording_meters_mix_record_sources_and_unarmed_tape() -> None:
+    class RecordingContext:
+        armed_tracks = (True, False) + (False,) * 6
+
+    class RecordingTransport:
+        def prepare_audio(
+            self,
+            frames: int,
+            status: object,
+            destination: np.ndarray | None = None,
+        ) -> tuple[np.ndarray, RecordingContext]:
+            assert destination is not None
+            destination.fill(0)
+            destination[:, 0] = 0.1
+            destination[:, 1] = 0.2
+            return destination, RecordingContext()
+
+        def submit_capture(
+            self,
+            context: object,
+            input_data: np.ndarray,
+            stereo_bus: np.ndarray,
+        ) -> None:
+            pass
+
+    routes = (0, 1) + (None,) * 6
+    state = MixerState.from_track_inputs(routes)
+    state.tracks[0].muted = True
+    state.tracks[1].muted = True
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.set_transport(RecordingTransport())
+    engine.start(
+        settings(track_inputs=routes),
+        state,
+        device(inputs=2, index=1),
+        device(outputs=2, index=2),
+    )
+    callback = backend.streams[0].kwargs["callback"]
+    indata = np.column_stack(
+        (
+            np.full(4, 0.5, dtype=np.float32),
+            np.full(4, 0.75, dtype=np.float32),
+        )
+    )
+
+    callback(
+        indata,
+        np.zeros((4, 2), dtype=np.float32),
+        4,
+        None,
+        None,
+    )
+    snapshot = engine.meter_snapshot
+
+    assert snapshot.track_db[0] == pytest.approx(peak_db(0.5))
+    assert snapshot.track_db[1] == pytest.approx(peak_db(0.2))
+
+
+def test_stereo_bus_record_meter_is_post_fader_but_bus_meter_is_pre_fader() -> None:
+    class RecordingContext:
+        armed_tracks = (False, True) + (False,) * 6
+
+    class LoopbackTransport:
+        def prepare_audio(
+            self,
+            frames: int,
+            status: object,
+            destination: np.ndarray | None = None,
+        ) -> tuple[np.ndarray, RecordingContext]:
+            assert destination is not None
+            destination.fill(0)
+            destination[:, 0] = 0.4
+            return destination, RecordingContext()
+
+        def submit_capture(
+            self,
+            context: object,
+            input_data: np.ndarray,
+            stereo_bus: np.ndarray,
+        ) -> None:
+            pass
+
+    routes = (None, StereoBusInput.LEFT) + (None,) * 6
+    state = MixerState.from_track_inputs(routes)
+    state.tracks[0].pan = -1
+    state.bus_level_db = -6
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.set_transport(LoopbackTransport())
+    engine.start(
+        settings(track_inputs=routes),
+        state,
+        device(inputs=1, index=1),
+        device(outputs=2, index=2),
+    )
+    callback = backend.streams[0].kwargs["callback"]
+
+    callback(
+        np.zeros((4, 1), dtype=np.float32),
+        np.zeros((4, 2), dtype=np.float32),
+        4,
+        None,
+        None,
+    )
+    snapshot = engine.meter_snapshot
+
+    assert snapshot.track_db[1] == pytest.approx(
+        peak_db(0.4 * db_to_gain(-6)), abs=1e-5
+    )
+    assert snapshot.bus_db[0] == pytest.approx(peak_db(0.4))
+
+
+def test_meter_has_immediate_attack_timed_fall_and_stop_reset() -> None:
+    backend = FakeBackend()
+    engine = AudioEngine(backend)
+    engine.start(
+        settings(),
+        MixerState.from_track_inputs((0,) + (None,) * 7),
+        device(inputs=1, index=1),
+        device(outputs=2, index=2),
+    )
+    callback = backend.streams[0].kwargs["callback"]
+
+    callback(
+        np.ones((1, 1), dtype=np.float32),
+        np.zeros((1, 2), dtype=np.float32),
+        1,
+        None,
+        None,
+    )
+    assert engine.meter_snapshot.track_db[0] == pytest.approx(0)
+
+    callback(
+        np.zeros((4_800, 1), dtype=np.float32),
+        np.zeros((4_800, 2), dtype=np.float32),
+        4_800,
+        None,
+        None,
+    )
+    assert engine.meter_snapshot.track_db[0] == pytest.approx(-2.0)
+
+    engine.stop()
+    assert engine.meter_snapshot.track_db == (METER_FLOOR_DB,) * 8
+    assert engine.meter_snapshot.bus_db == (METER_FLOOR_DB,) * 2
 
 
 def test_callback_routes_project_playback_through_the_mixer() -> None:

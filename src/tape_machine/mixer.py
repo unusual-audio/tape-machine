@@ -32,6 +32,10 @@ from tape_machine.theme import (
     KNOB_BACKGROUND,
     KNOB_BORDER,
     KNOB_INDICATOR,
+    METER_GREEN,
+    METER_OFF,
+    METER_RED,
+    METER_YELLOW,
 )
 
 
@@ -40,9 +44,13 @@ MAX_LEVEL_DB = MIX_MAX_LEVEL_DB
 UNITY_LEVEL_DB = 0.0
 
 _TRACK_STRIP_WIDTH = 88
+_FADER_WIDTH = 58
 _FADER_HEIGHT = 230
 _FADER_TOP = 12
 _FADER_BOTTOM = 214
+_METER_CEILING_DB = 0.0
+_METER_YELLOW_DB = -12.0
+_METER_RED_DB = -3.0
 
 _CONTROL_COLORS = {
     "record_enabled": ACCENT_RED,
@@ -62,6 +70,14 @@ def format_level_db(value: float) -> str:
     if value <= MIN_LEVEL_DB:
         return "−∞ dB"
     return f"{value:+.1f} dB"
+
+
+def level_y(value: float) -> float:
+    """Map a fader or meter dB value onto the shared vertical scale."""
+    ratio = (clamp(value, MIN_LEVEL_DB, MAX_LEVEL_DB) - MIN_LEVEL_DB) / (
+        MAX_LEVEL_DB - MIN_LEVEL_DB
+    )
+    return _FADER_BOTTOM - ratio * (_FADER_BOTTOM - _FADER_TOP)
 
 
 def clear_canvas(canvas: toga.Canvas) -> None:
@@ -245,11 +261,17 @@ class VerticalFader:
         self,
         value: float,
         on_change: Callable[[float], None],
+        *,
+        meter_channels: int = 1,
     ) -> None:
+        if meter_channels not in (1, 2):
+            raise ValueError("A fader meter must have one or two channels.")
         self.value = clamp(value, MIN_LEVEL_DB, MAX_LEVEL_DB)
         self.on_change = on_change
+        self.meter_channels = meter_channels
+        self.meter_levels = (MIN_LEVEL_DB,) * meter_channels
         self.canvas = toga.Canvas(
-            width=48,
+            width=_FADER_WIDTH,
             height=_FADER_HEIGHT,
             on_resize=self._draw,
             on_press=self._move,
@@ -283,6 +305,21 @@ class VerticalFader:
         if notify:
             self.on_change(self.value)
 
+    def set_meter_levels(self, levels: tuple[float, ...]) -> None:
+        """Update one mono or stereo meter without changing fader state."""
+        if len(levels) != self.meter_channels:
+            raise ValueError(
+                f"This fader requires {self.meter_channels} meter channels."
+            )
+        normalized = tuple(
+            clamp(level, MIN_LEVEL_DB, _METER_CEILING_DB)
+            for level in levels
+        )
+        if normalized == self.meter_levels:
+            return
+        self.meter_levels = normalized
+        self._draw(self.canvas)
+
     def _move(
         self, widget: toga.Canvas, x: int, y: int, **kwargs: object
     ) -> None:
@@ -302,10 +339,7 @@ class VerticalFader:
             widget.line_to(center_x, _FADER_BOTTOM)
 
         for tick_db in (6, 0, -12, -24, -36, -48, -60):
-            ratio = (tick_db - MIN_LEVEL_DB) / (MAX_LEVEL_DB - MIN_LEVEL_DB)
-            tick_y = _FADER_BOTTOM - ratio * (
-                _FADER_BOTTOM - _FADER_TOP
-            )
+            tick_y = level_y(tick_db)
             with widget.stroke(color=FADER_TICK, line_width=1):
                 widget.begin_path()
                 widget.move_to(7, tick_y)
@@ -313,14 +347,49 @@ class VerticalFader:
                 widget.move_to(34, tick_y)
                 widget.line_to(41, tick_y)
 
-        ratio = (self.value - MIN_LEVEL_DB) / (MAX_LEVEL_DB - MIN_LEVEL_DB)
-        handle_y = _FADER_BOTTOM - ratio * (_FADER_BOTTOM - _FADER_TOP)
+        meter_geometry = (
+            ((51, 5),)
+            if self.meter_channels == 1
+            else ((49, 3), (54, 3))
+        )
+        for (meter_x, meter_width), meter_level in zip(
+            meter_geometry, self.meter_levels, strict=True
+        ):
+            self._draw_meter(widget, meter_x, meter_width, meter_level)
+
+        handle_y = level_y(self.value)
         with widget.fill(color=FADER_HANDLE):
             widget.rect(5, handle_y - 8, 38, 16)
         with widget.stroke(color=FADER_INDICATOR, line_width=2):
             widget.begin_path()
             widget.move_to(6, handle_y)
             widget.line_to(42, handle_y)
+
+    @staticmethod
+    def _draw_meter(
+        widget: toga.Canvas,
+        x: int,
+        width: int,
+        level: float,
+    ) -> None:
+        meter_top = level_y(_METER_CEILING_DB)
+        with widget.fill(color=METER_OFF):
+            widget.rect(
+                x, meter_top, width, _FADER_BOTTOM - meter_top
+            )
+        segments = (
+            (MIN_LEVEL_DB, _METER_YELLOW_DB, METER_GREEN),
+            (_METER_YELLOW_DB, _METER_RED_DB, METER_YELLOW),
+            (_METER_RED_DB, _METER_CEILING_DB, METER_RED),
+        )
+        for segment_floor, segment_ceiling, color in segments:
+            lit_ceiling = min(level, segment_ceiling)
+            if lit_ceiling <= segment_floor:
+                continue
+            top = level_y(lit_ceiling)
+            bottom = level_y(segment_floor)
+            with widget.fill(color=color):
+                widget.rect(x, top, width, bottom - top)
 
 
 class PanKnob:
@@ -515,7 +584,9 @@ class StereoBusStrip:
     def __init__(self, mixer_state: MixerState) -> None:
         self.mixer_state = mixer_state
         self.fader = VerticalFader(
-            mixer_state.bus_level_db, mixer_state.set_bus_level
+            mixer_state.bus_level_db,
+            mixer_state.set_bus_level,
+            meter_channels=2,
         )
         self.widget = toga.Box(
             children=[
@@ -593,3 +664,21 @@ class MixerView:
         for strip in self.track_strips:
             strip.record_enable_locked = locked
             strip.sync_controls()
+
+    def set_meter_levels(
+        self,
+        track_db: tuple[float, ...],
+        bus_db: tuple[float, float],
+    ) -> None:
+        """Distribute one engine meter snapshot across the mixer strips."""
+        if len(track_db) != PROJECT_TRACK_COUNT:
+            raise ValueError(
+                f"Mixer metering requires {PROJECT_TRACK_COUNT} tracks."
+            )
+        if len(bus_db) != 2:
+            raise ValueError("Stereo-bus metering requires two channels.")
+        for strip, level in zip(
+            self.track_strips, track_db, strict=True
+        ):
+            strip.fader.set_meter_levels((level,))
+        self.bus_strip.fader.set_meter_levels(bus_db)

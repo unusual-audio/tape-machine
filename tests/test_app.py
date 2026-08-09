@@ -14,7 +14,7 @@ from tape_machine.audio import (
     StereoBusInput,
 )
 from tape_machine.config import AppConfig, StoredAudioSettings, WindowPosition
-from tape_machine.engine import AudioEngineError
+from tape_machine.engine import AudioEngineError, MeterSnapshot
 from tape_machine.mixer import MixerState
 from tape_machine.project import ProjectMetadata
 from tape_machine.transport import TransportMode
@@ -380,6 +380,26 @@ def test_mixer_change_rebuilds_running_engine_matrix() -> None:
     assert arm_calls == [(False, False, True, False, False, False, False, False)]
     assert project.dirty is True
     assert project.staged[-1].mix.tracks[2].record_enabled is True
+
+
+def test_meter_sync_distributes_the_latest_engine_snapshot() -> None:
+    calls: list[tuple[tuple[float, ...], tuple[float, float]]] = []
+    snapshot = MeterSnapshot(
+        tuple(-float(index) for index in range(8)),
+        (-9.0, -12.0),
+    )
+    app = SimpleNamespace(
+        audio_engine=SimpleNamespace(meter_snapshot=snapshot),
+        mixer_view=SimpleNamespace(
+            set_meter_levels=lambda tracks, bus: calls.append(
+                (tracks, bus)
+            )
+        ),
+    )
+
+    TapeMachine._sync_meters(app)
+
+    assert calls == [(snapshot.track_db, snapshot.bus_db)]
 
 
 def test_audio_failure_stops_engine_and_disables_monitoring() -> None:
