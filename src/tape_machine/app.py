@@ -9,7 +9,7 @@ from typing import Callable
 import toga
 from rubicon.objc import NSObject, ObjCClass, objc_const, objc_method
 from rubicon.objc.runtime import load_library
-from toga.style.pack import CENTER, COLUMN, ROW
+from toga.style.pack import CENTER, COLUMN, ROW, START
 from toga_cocoa.libs import NSCursor
 
 from tape_machine.audio import (
@@ -23,6 +23,7 @@ from tape_machine.config import (
     AppConfig,
     AppConfigError,
     AppConfigStore,
+    MAX_RECENT_FILES,
     StoredAudioSettings,
     WindowPosition,
 )
@@ -33,6 +34,7 @@ from tape_machine.settings import AudioSettingsDraft, AudioSettingsWindow
 from tape_machine.theme import (
     ACCENT_BLUE,
     ACCENT_RED,
+    SECONDARY_TEXT,
     force_dark_appearance,
 )
 from tape_machine.transport import (
@@ -47,6 +49,12 @@ _TRANSPORT_BUTTON_WIDTH = 80
 _TRANSPORT_BAR_WIDTH = 880
 _LOGO_DISPLAY_WIDTH = 208
 _LOGO_DISPLAY_HEIGHT = 20
+_TRANSPORT_CONTROL_HEIGHT = 28
+_MAIN_CONTENT_HORIZONTAL_MARGIN = 16
+_PROJECT_CONTENT_TOP_MARGIN = 12
+_INITIAL_CONTENT_TOP_MARGIN = _PROJECT_CONTENT_TOP_MARGIN + (
+    _TRANSPORT_CONTROL_HEIGHT - _LOGO_DISPLAY_HEIGHT
+) // 2
 _LOGO_RESOURCE = Path(__file__).with_name("resources") / "logo@2x.png"
 _MAIN_WINDOW_SIZE = (912, 584)
 _AUDIO_SETTINGS_WINDOW_SIZE = (900, 640)
@@ -61,8 +69,8 @@ _NUMBER_SPACING_FEATURE_TYPE = 6
 _TABULAR_NUMBERS_SELECTOR = 0
 
 
-class RoutingStatusCursorOwner(NSObject):
-    """Set the pointing-hand cursor while it is over the routing link."""
+class LinkCursorOwner(NSObject):
+    """Set the pointing-hand cursor while it is over a text link."""
 
     @objc_method
     def cursorUpdate_(self, event) -> None:
@@ -126,7 +134,12 @@ def _fit_window_position(
     )
 
 
-def _style_status_link(button: toga.Button) -> None:
+def _style_link(
+    button: toga.Button,
+    *,
+    color: str,
+    tooltip: str | None = None,
+) -> None:
     """Give a native Cocoa button the appearance of an inline text link."""
     from toga.colors import Color
     from toga_cocoa.colors import native_color
@@ -145,15 +158,15 @@ def _style_status_link(button: toga.Button) -> None:
     attributes = NSMutableDictionary.alloc().init()
     attributes[NSFontAttributeName] = native.font
     attributes[NSForegroundColorAttributeName] = native_color(
-        Color.parse(ACCENT_RED)
+        Color.parse(color)
     )
     attributes[NSUnderlineStyleAttributeName] = 1
     native.bordered = False
-    native.toolTip = "Open Audio Settings"
+    native.toolTip = tooltip
     native.attributedTitle = NSAttributedString.alloc().initWithString(
         button.text, attributes=attributes
     )
-    cursor_owner = RoutingStatusCursorOwner.alloc().init()
+    cursor_owner = LinkCursorOwner.alloc().init()
     tracking_area = ObjCClass("NSTrackingArea").alloc().initWithRect(
         NSMakeRect(0, 0, 0, 0),
         options=(
@@ -165,9 +178,48 @@ def _style_status_link(button: toga.Button) -> None:
         userInfo=None,
     )
     native.addTrackingArea(tracking_area)
-    button._routing_cursor_owner = cursor_owner
-    button._routing_tracking_area = tracking_area
+    button._link_cursor_owner = cursor_owner
+    button._link_tracking_area = tracking_area
     button._impl.rehint()
+
+
+def _style_status_link(button: toga.Button) -> None:
+    """Style the routing warning as a red settings link."""
+    _style_link(
+        button,
+        color=ACCENT_RED,
+        tooltip="Open Audio Settings",
+    )
+
+
+def _display_parent_path(path: Path) -> str:
+    """Format a recent project's parent path compactly for the launcher."""
+    parent = path.expanduser().resolve(strict=False).parent
+    home = Path.home().resolve(strict=False)
+    try:
+        relative = parent.relative_to(home)
+    except ValueError:
+        return str(parent)
+    return "~" if relative == Path(".") else str(Path("~") / relative)
+
+
+def _link_button(
+    text: str,
+    action: Callable[..., object],
+    *,
+    tooltip: str,
+    font_size: int = 12,
+) -> toga.Button:
+    """Create one blue, underlined Cocoa text link."""
+    button = toga.Button(
+        text,
+        on_press=action,
+        height=20,
+        font_size=font_size,
+        color=ACCENT_BLUE,
+    )
+    _style_link(button, color=ACCENT_BLUE, tooltip=tooltip)
+    return button
 
 
 class ShuttleButton:
@@ -187,7 +239,7 @@ class ShuttleButton:
     ) -> None:
         self.text = text
         self.width = width
-        self.height = 28
+        self.height = _TRANSPORT_CONTROL_HEIGHT
         self.on_press = on_press
         self.on_release = on_release
         self._enabled = True
@@ -400,32 +452,67 @@ class TapeMachine(toga.App):
         self.main_window.show()
 
     def _build_initial_screen(self) -> toga.Box:
-        central_content = toga.Box(
+        self.initial_logo_view = toga.ImageView(
+            _LOGO_RESOURCE,
+            width=_LOGO_DISPLAY_WIDTH,
+            height=_LOGO_DISPLAY_HEIGHT,
+        )
+        action_links = toga.Box(
             children=[
-                toga.Label(
-                    "Tape Machine",
-                    font_size=28,
-                    font_weight="bold",
-                    text_align=CENTER,
+                _link_button(
+                    "New Project",
+                    self.new_project,
+                    tooltip="Create a new project",
+                    font_size=11,
                 ),
-                toga.Label(
-                    "Create a new eight-track project or open an existing "
-                    "WAV project.",
-                    text_align=CENTER,
-                    margin_top=12,
-                ),
-                toga.Label(
-                    "Choose File → New Project or File → Open Project… "
-                    "to get started.",
-                    text_align=CENTER,
-                    margin_top=6,
+                _link_button(
+                    "Open Project…",
+                    self.open_project,
+                    tooltip="Open an existing WAV project",
+                    font_size=11,
                 ),
             ],
-            direction=COLUMN,
+            direction=ROW,
             align_items=CENTER,
-            justify_content=CENTER,
+            gap=22,
+            margin_top=24,
+        )
+        self.initial_recent_files_box = toga.Box(
+            children=self._initial_recent_file_widgets(),
+            direction=COLUMN,
+            align_items=START,
+            gap=5,
+        )
+        recent_section = toga.Box(
+            children=[
+                toga.Label(
+                    "Recent Projects",
+                    color=SECONDARY_TEXT,
+                    font_size=11,
+                    font_weight="bold",
+                    margin_bottom=8,
+                ),
+                self.initial_recent_files_box,
+            ],
+            direction=COLUMN,
+            align_items=START,
+            width=640,
+            margin_top=38,
+        )
+        central_content = toga.Box(
+            children=[
+                self.initial_logo_view,
+                action_links,
+                recent_section,
+            ],
+            direction=COLUMN,
+            align_items=START,
+            justify_content=START,
             flex=1,
-            margin=24,
+            margin_top=_INITIAL_CONTENT_TOP_MARGIN,
+            margin_left=_MAIN_CONTENT_HORIZONTAL_MARGIN,
+            margin_right=_MAIN_CONTENT_HORIZONTAL_MARGIN,
+            margin_bottom=12,
         )
         return toga.Box(
             children=[
@@ -434,6 +521,52 @@ class TapeMachine(toga.App):
             ],
             direction=COLUMN,
         )
+
+    def _initial_recent_file_widgets(self) -> list[toga.Widget]:
+        """Build the current recent-project rows for the initial screen."""
+        if not self.app_config.recent_files:
+            return [
+                toga.Label(
+                    "No recent projects",
+                    color=SECONDARY_TEXT,
+                    font_size=11,
+                )
+            ]
+
+        rows: list[toga.Widget] = []
+        for path in self.app_config.recent_files[:MAX_RECENT_FILES]:
+            rows.append(
+                toga.Box(
+                    children=[
+                        _link_button(
+                            path.name,
+                            self._recent_file_action(path),
+                            tooltip=str(path),
+                            font_size=11,
+                        ),
+                        toga.Label(
+                            _display_parent_path(path),
+                            color=SECONDARY_TEXT,
+                            font_size=10,
+                            flex=1,
+                        ),
+                    ],
+                    direction=ROW,
+                    align_items=CENTER,
+                    gap=10,
+                    width=640,
+                )
+            )
+        return rows
+
+    def _refresh_initial_recent_files(self) -> None:
+        """Synchronize the visible launcher list with application config."""
+        recent_box = getattr(self, "initial_recent_files_box", None)
+        if recent_box is None or getattr(self, "project", None) is not None:
+            return
+        for child in list(recent_box.children):
+            recent_box.remove(child)
+        recent_box.add(*self._initial_recent_file_widgets())
 
     def _build_project_screen(self) -> toga.Box:
         assert self.project is not None
@@ -455,13 +588,13 @@ class TapeMachine(toga.App):
             _RECORD_BUTTON_TEXT,
             on_press=self._toggle_transport_record,
             width=_TRANSPORT_BUTTON_WIDTH,
-            height=28,
+            height=_TRANSPORT_CONTROL_HEIGHT,
         )
         self.transport_play_button = toga.Button(
             _PLAY_BUTTON_TEXT,
             on_press=self._play_transport,
             width=_TRANSPORT_BUTTON_WIDTH,
-            height=28,
+            height=_TRANSPORT_CONTROL_HEIGHT,
         )
         self.transport_rewind_button = ShuttleButton(
             _REWIND_BUTTON_TEXT,
@@ -483,7 +616,7 @@ class TapeMachine(toga.App):
             _RTZ_BUTTON_TEXT,
             on_press=self._stop_or_rtz,
             width=_TRANSPORT_BUTTON_WIDTH,
-            height=28,
+            height=_TRANSPORT_CONTROL_HEIGHT,
         )
         self.transport_time_label = toga.Label(
             "00:00.000",
@@ -522,9 +655,9 @@ class TapeMachine(toga.App):
             direction=COLUMN,
             align_items=CENTER,
             flex=1,
-            margin_top=12,
-            margin_left=16,
-            margin_right=16,
+            margin_top=_PROJECT_CONTENT_TOP_MARGIN,
+            margin_left=_MAIN_CONTENT_HORIZONTAL_MARGIN,
+            margin_right=_MAIN_CONTENT_HORIZONTAL_MARGIN,
         )
         return toga.Box(
             children=[central_content, self._build_status_footer()],
@@ -538,8 +671,8 @@ class TapeMachine(toga.App):
                 self.status_line_content,
             ],
             direction=COLUMN,
-            margin_left=16,
-            margin_right=16,
+            margin_left=_MAIN_CONTENT_HORIZONTAL_MARGIN,
+            margin_right=_MAIN_CONTENT_HORIZONTAL_MARGIN,
             margin_bottom=12,
         )
 
@@ -595,6 +728,7 @@ class TapeMachine(toga.App):
         self.recent_file_commands = file_commands
         self.recent_menu_commands = menu_commands
         self.commands.add(*menu_commands)
+        self._refresh_initial_recent_files()
 
     def _persist_noncritical_config(self) -> None:
         try:

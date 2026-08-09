@@ -23,7 +23,8 @@ from tape_machine.audio import (
 
 
 CONFIG_SCHEMA_VERSION = 4
-MAX_RECENT_FILES = 10
+# Fourteen compact launcher rows fit above the fixed main-window footer.
+MAX_RECENT_FILES = 14
 
 
 class AppConfigError(RuntimeError):

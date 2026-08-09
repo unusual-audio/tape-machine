@@ -35,6 +35,7 @@ from tape_machine.theme import (
     KNOB_BACKGROUND,
     KNOB_BORDER,
     KNOB_INDICATOR,
+    KNOB_MARKING,
     METER_GREEN,
     METER_OFF,
     METER_RED,
@@ -457,9 +458,21 @@ class PanKnob:
         )
         markings = toga.Box(
             children=[
-                toga.Label("L", font_size=9, flex=1),
-                toga.Label("C", font_size=9, text_align=CENTER, flex=1),
-                toga.Label("R", font_size=9, text_align="right", flex=1),
+                toga.Label("L", color=KNOB_MARKING, font_size=9, flex=1),
+                toga.Label(
+                    "C",
+                    color=KNOB_MARKING,
+                    font_size=9,
+                    text_align=CENTER,
+                    flex=1,
+                ),
+                toga.Label(
+                    "R",
+                    color=KNOB_MARKING,
+                    font_size=9,
+                    text_align="right",
+                    flex=1,
+                ),
             ],
             direction=ROW,
             width=56,

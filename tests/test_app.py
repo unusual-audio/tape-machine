@@ -7,12 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import tape_machine.app as app_module
 from tape_machine.app import (
     ShuttleButton,
     TapeMachine,
     _LOGO_DISPLAY_HEIGHT,
     _LOGO_DISPLAY_WIDTH,
     _LOGO_RESOURCE,
+    _display_parent_path,
     _fit_window_position,
     _tabular_number_font,
 )
@@ -22,7 +24,12 @@ from tape_machine.audio import (
     DeviceReference,
     StereoBusInput,
 )
-from tape_machine.config import AppConfig, StoredAudioSettings, WindowPosition
+from tape_machine.config import (
+    MAX_RECENT_FILES,
+    AppConfig,
+    StoredAudioSettings,
+    WindowPosition,
+)
 from tape_machine.engine import AudioEngineError, MeterSnapshot
 from tape_machine.mixer import MixerState
 from tape_machine.project import ProjectMetadata
@@ -160,6 +167,102 @@ def test_logo_resource_has_two_x_dimensions_and_alpha() -> None:
         _LOGO_DISPLAY_HEIGHT * 2,
     )
     assert data[25] == 6
+
+
+def test_recent_project_parent_paths_abbreviate_the_home_directory() -> None:
+    home = Path.home()
+
+    assert _display_parent_path(home / "project.wav") == "~"
+    assert (
+        _display_parent_path(home / "Music" / "Sessions" / "project.wav")
+        == "~/Music/Sessions"
+    )
+
+
+def test_initial_screen_uses_left_aligned_logo_and_quiet_recent_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeWidget:
+        def __init__(
+            self,
+            kind: str,
+            *args: object,
+            children: list[object] | None = None,
+            **kwargs: object,
+        ) -> None:
+            self.kind = kind
+            self.args = args
+            self.children = list(children or ())
+            self.options = kwargs
+
+    monkeypatch.setattr(
+        app_module.toga,
+        "Box",
+        lambda *args, **kwargs: FakeWidget("box", *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        app_module.toga,
+        "Label",
+        lambda *args, **kwargs: FakeWidget("label", *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        app_module.toga,
+        "ImageView",
+        lambda *args, **kwargs: FakeWidget("image", *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_link_button",
+        lambda *args, **kwargs: FakeWidget("link", *args, **kwargs),
+    )
+
+    recent_files = tuple(
+        Path.home() / "Music" / f"Session {index:02d}.wav"
+        for index in range(MAX_RECENT_FILES + 2)
+    )
+    footer = FakeWidget("footer")
+    app = SimpleNamespace(
+        app_config=AppConfig(recent_files=recent_files),
+        new_project=object(),
+        open_project=object(),
+        _recent_file_action=lambda path: path,
+        _build_status_footer=lambda: footer,
+    )
+    app._initial_recent_file_widgets = (
+        lambda: TapeMachine._initial_recent_file_widgets(app)
+    )
+
+    screen = TapeMachine._build_initial_screen(app)
+
+    central_content = screen.children[0]
+    logo, actions, recent_section = central_content.children
+    assert logo.args == (_LOGO_RESOURCE,)
+    assert logo.options["width"] == _LOGO_DISPLAY_WIDTH
+    assert logo.options["height"] == _LOGO_DISPLAY_HEIGHT
+    assert central_content.options["align_items"] == app_module.START
+    assert central_content.options["justify_content"] == app_module.START
+    assert central_content.options["margin_top"] == 16
+    assert central_content.options["margin_left"] == 16
+    assert central_content.options["margin_right"] == 16
+    assert central_content.options["margin_bottom"] == 12
+    assert [link.args[0] for link in actions.children] == [
+        "New Project",
+        "Open Project…",
+    ]
+    assert all(link.options["font_size"] == 11 for link in actions.children)
+    assert recent_section.children[0].args == ("Recent Projects",)
+    assert screen.children[1] is footer
+
+    rows = app.initial_recent_files_box.children
+    assert len(rows) == MAX_RECENT_FILES
+    assert all(row.options["width"] == 640 for row in rows)
+    assert all(row.children[0].options["font_size"] == 11 for row in rows)
+    assert all(row.children[1].options["font_size"] == 10 for row in rows)
+
+    app.app_config = AppConfig()
+    empty_state = TapeMachine._initial_recent_file_widgets(app)
+    assert empty_state[0].args == ("No recent projects",)
+    assert empty_state[0].options["font_size"] == 11
 
 
 def test_status_line_marks_incomplete_routing() -> None:
@@ -796,6 +899,52 @@ def test_recent_files_are_persisted_and_menu_is_rebuilt(tmp_path: Path) -> None:
     assert saved[-1].recent_files == ()
     assert len(saved) == 2
     assert len(rebuilds) == 2
+
+
+def test_recent_file_action_opens_its_project_path(tmp_path: Path) -> None:
+    opened: list[Path] = []
+    project_path = tmp_path / "project.wav"
+
+    async def open_project(path: Path) -> None:
+        opened.append(path)
+
+    app = SimpleNamespace(_open_project_path=open_project)
+
+    asyncio.run(TapeMachine._recent_file_action(app, project_path)())
+
+    assert opened == [project_path]
+
+
+def test_initial_recent_files_refresh_replaces_visible_rows() -> None:
+    old_rows = [object(), object()]
+    new_rows = [object(), object(), object()]
+
+    class FakeBox:
+        def __init__(self) -> None:
+            self.children = list(old_rows)
+
+        def remove(self, child: object) -> None:
+            self.children.remove(child)
+
+        def add(self, *children: object) -> None:
+            self.children.extend(children)
+
+    recent_box = FakeBox()
+    app = SimpleNamespace(
+        project=None,
+        initial_recent_files_box=recent_box,
+        _initial_recent_file_widgets=lambda: new_rows,
+    )
+
+    TapeMachine._refresh_initial_recent_files(app)
+
+    assert recent_box.children == new_rows
+
+    app.project = object()
+    app._initial_recent_file_widgets = lambda: [object()]
+    TapeMachine._refresh_initial_recent_files(app)
+
+    assert recent_box.children == new_rows
 
 
 def test_window_positions_merge_with_existing_config() -> None:
