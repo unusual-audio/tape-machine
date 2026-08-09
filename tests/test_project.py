@@ -20,6 +20,7 @@ def project_metadata() -> ProjectMetadata:
     mix = MixerMetadata(
         tracks=tuple(
             TrackMixMetadata(
+                name=f"Channel {index + 1}",
                 level_db=-float(index),
                 pan=(index - 3.5) / 3.5,
                 record_enabled=index % 2 == 0,
@@ -105,7 +106,7 @@ def test_project_metadata_contains_only_project_state() -> None:
     comment = metadata.to_comment()
     payload = json.loads(comment[len(PROJECT_COMMENT_PREFIX) :])
 
-    assert payload["schema_version"] == 5
+    assert payload["schema_version"] == 6
     assert set(payload) == {"application", "schema_version", "mix"}
     assert ProjectMetadata.from_comment(comment) == metadata
 
@@ -125,6 +126,48 @@ def test_legacy_project_metadata_schemas_are_rejected(
         )
 
 
+def test_schema_five_projects_gain_default_names_and_require_save(
+    tmp_path: Path,
+) -> None:
+    payload = json.loads(
+        project_metadata().to_comment()[len(PROJECT_COMMENT_PREFIX) :]
+    )
+    payload["schema_version"] = 5
+    for track in payload["mix"]["tracks"]:
+        track.pop("name")
+    comment = PROJECT_COMMENT_PREFIX + json.dumps(payload)
+
+    migrated = ProjectMetadata.from_comment(comment)
+
+    assert migrated is not None
+    assert [track.name for track in migrated.mix.tracks] == [
+        f"Track {index}" for index in range(1, 9)
+    ]
+
+    path = tmp_path / "version-five.wav"
+    with soundfile.SoundFile(
+        path,
+        "w",
+        samplerate=48_000,
+        channels=8,
+        subtype="PCM_24",
+        format="WAV",
+    ) as audio_file:
+        audio_file.comment = comment
+
+    project = AudioProject.open(path)
+    assert project.dirty is True
+    project.save()
+    saved_payload = json.loads(
+        project.audio_file.comment[len(PROJECT_COMMENT_PREFIX) :]
+    )
+    assert saved_payload["schema_version"] == 6
+    assert [track["name"] for track in saved_payload["mix"]["tracks"]] == [
+        f"Track {index}" for index in range(1, 9)
+    ]
+    project.close()
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -140,6 +183,14 @@ def test_legacy_project_metadata_schemas_are_rejected(
         (
             lambda mix: mix["tracks"][0].update(muted="yes"),
             "muted must be boolean",
+        ),
+        (
+            lambda mix: mix["tracks"][0].update(name=123),
+            "track name must be text",
+        ),
+        (
+            lambda mix: mix["tracks"][0].update(name="x" * 17),
+            "track name must be at most 16 characters",
         ),
     ],
 )

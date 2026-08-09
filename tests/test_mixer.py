@@ -11,6 +11,7 @@ from tape_machine.mixer import (
     MixerState,
     MixerView,
     PanKnob,
+    TrackStrip,
     VerticalFader,
     format_level_db,
     level_y,
@@ -42,10 +43,14 @@ def test_mixer_defaults_to_unity_centered_and_inactive() -> None:
     assert not any(track.input_monitoring for track in state.tracks)
     assert not any(track.muted for track in state.tracks)
     assert not any(track.soloed for track in state.tracks)
+    assert [track.name for track in state.tracks] == [
+        f"Track {index}" for index in range(1, 9)
+    ]
 
 
 def test_mixer_restores_and_snapshots_all_persisted_controls() -> None:
     saved_track = TrackMixMetadata(
+        name="Lead Vocal",
         level_db=-12.5,
         pan=0.75,
         record_enabled=True,
@@ -54,7 +59,11 @@ def test_mixer_restores_and_snapshots_all_persisted_controls() -> None:
         soloed=True,
     )
     mix = MixerMetadata(
-        tracks=(saved_track,) + (TrackMixMetadata(),) * 7,
+        tracks=(saved_track,)
+        + tuple(
+            TrackMixMetadata(name=f"Track {index}")
+            for index in range(2, 9)
+        ),
         bus_level_db=-4.5,
     )
     routes = (99,) + (None,) * 7
@@ -68,12 +77,14 @@ def test_mixer_restores_and_snapshots_all_persisted_controls() -> None:
     assert state.tracks[0].input_monitoring is True
     assert state.tracks[0].muted is True
     assert state.tracks[0].soloed is True
+    assert state.tracks[0].name == "Lead Vocal"
     assert state.bus_level_db == -4.5
     assert state.to_metadata(routes) == mix
 
 
 def test_restoring_unassigned_track_clears_only_input_controls() -> None:
     saved_track = TrackMixMetadata(
+        name="Track 1",
         record_enabled=True,
         input_monitoring=True,
         muted=True,
@@ -91,7 +102,7 @@ def test_restoring_unassigned_track_clears_only_input_controls() -> None:
     assert track.muted is True
     assert track.soloed is True
     assert state.to_metadata().tracks[0] == TrackMixMetadata(
-        muted=True, soloed=True
+        muted=True, soloed=True, name="Track 1"
     )
 
 
@@ -279,6 +290,47 @@ def test_mixer_changes_notify_the_audio_engine() -> None:
     state.toggle(0, "muted")
 
     assert len(notifications) == 5
+
+
+def test_track_names_are_normalized_and_notify_only_when_changed() -> None:
+    state = MixerState()
+    notifications: list[None] = []
+    state.on_change = lambda: notifications.append(None)
+
+    assert state.set_track_name(0, "  Lead Vocal  ") == "Lead Vocal"
+    assert state.set_track_name(0, "Lead Vocal") == "Lead Vocal"
+    assert state.set_track_name(0, "   ") == "Track 1"
+    assert state.set_track_name(1, "x" * 20) == "x" * 16
+
+    assert state.tracks[0].name == "Track 1"
+    assert state.tracks[1].name == "x" * 16
+    assert len(notifications) == 3
+
+
+def test_scribble_strip_limits_and_commits_inline_edits() -> None:
+    state = MixerState()
+    notifications: list[None] = []
+    state.on_change = lambda: notifications.append(None)
+    strip = TrackStrip.__new__(TrackStrip)
+    strip.index = 0
+    strip.mixer_state = state
+    strip._normalizing_name = False
+    widget = SimpleNamespace(value="🎤" * 17)
+
+    strip._limit_name(widget)
+    assert widget.value == "🎤" * 16
+    assert notifications == []
+
+    widget.value = "  Vocals  "
+    strip._commit_name(widget)
+    assert widget.value == "Vocals"
+    assert state.tracks[0].name == "Vocals"
+
+    widget.value = ""
+    strip._commit_name(widget)
+    assert widget.value == "Track 1"
+    assert state.tracks[0].name == "Track 1"
+    assert len(notifications) == 2
 
 
 def test_clearing_monitoring_notifies_only_when_state_changes() -> None:

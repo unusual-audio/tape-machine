@@ -23,11 +23,17 @@ from tape_machine.audio import (
 
 
 PROJECT_APPLICATION_ID = "pkg.unusualaudio.tape-machine"
-PROJECT_SCHEMA_VERSION = 5
+PROJECT_SCHEMA_VERSION = 6
 PROJECT_COMMENT_PREFIX = "TAPE_MACHINE_PROJECT:"
 WAV_FORMATS = {"WAV", "WAVEX", "RF64"}
 MIX_MIN_LEVEL_DB = -60.0
 MIX_MAX_LEVEL_DB = 6.0
+TRACK_NAME_MAX_LENGTH = 16
+
+
+def default_track_name(track_index: int) -> str:
+    """Return the user-visible fallback name for a zero-based track."""
+    return f"Track {track_index + 1}"
 
 
 class ProjectError(RuntimeError):
@@ -44,6 +50,7 @@ class TrackMixMetadata:
     input_monitoring: bool = False
     muted: bool = False
     soloed: bool = False
+    name: str = ""
 
     def __post_init__(self) -> None:
         _validate_mix_number(
@@ -58,6 +65,13 @@ class TrackMixMetadata:
         ):
             if not isinstance(value, bool):
                 raise ValueError(f"Track mix {name} must be boolean.")
+        if not isinstance(self.name, str):
+            raise ValueError("Project mix track name must be text.")
+        if len(self.name) > TRACK_NAME_MAX_LENGTH:
+            raise ValueError(
+                "Project mix track name must be at most "
+                f"{TRACK_NAME_MAX_LENGTH} characters."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +80,8 @@ class MixerMetadata:
 
     tracks: tuple[TrackMixMetadata, ...] = field(
         default_factory=lambda: tuple(
-            TrackMixMetadata() for _ in range(PROJECT_TRACK_COUNT)
+            TrackMixMetadata(name=default_track_name(index))
+            for index in range(PROJECT_TRACK_COUNT)
         )
     )
     bus_level_db: float = 0.0
@@ -118,8 +133,16 @@ class ProjectMetadata:
     @classmethod
     def from_comment(cls, comment: str) -> ProjectMetadata | None:
         """Parse tagged project metadata, or return None for an untagged WAV."""
+        metadata, _ = cls._from_comment_with_migration(comment)
+        return metadata
+
+    @classmethod
+    def _from_comment_with_migration(
+        cls, comment: str
+    ) -> tuple[ProjectMetadata | None, bool]:
+        """Parse metadata and report whether a v5 project was migrated."""
         if not comment.startswith(PROJECT_COMMENT_PREFIX):
-            return None
+            return None, False
         try:
             payload = json.loads(comment[len(PROJECT_COMMENT_PREFIX) :])
         except json.JSONDecodeError as exc:
@@ -132,7 +155,7 @@ class ProjectMetadata:
         if (
             not isinstance(schema_version, int)
             or isinstance(schema_version, bool)
-            or schema_version != PROJECT_SCHEMA_VERSION
+            or schema_version not in (5, PROJECT_SCHEMA_VERSION)
         ):
             raise ProjectError(
                 "This project uses an unsupported metadata schema version."
@@ -142,10 +165,13 @@ class ProjectMetadata:
             source_comment = payload.get("source_comment")
             if source_comment is not None and not isinstance(source_comment, str):
                 raise ValueError("source_comment must be text")
-            return cls(
+            metadata = cls(
                 source_comment=source_comment,
-                mix=_mixer_from_payload(payload["mix"]),
+                mix=_mixer_from_payload(
+                    payload["mix"], schema_version=schema_version
+                ),
             )
+            return metadata, schema_version == 5
         except (KeyError, TypeError, ValueError) as exc:
             raise ProjectError(f"Project metadata is invalid: {exc}") from exc
 
@@ -217,8 +243,10 @@ class AudioProject:
                 )
 
             comment = inspection_file.comment
-            metadata = ProjectMetadata.from_comment(comment)
-            dirty = metadata is None
+            metadata, migrated = ProjectMetadata._from_comment_with_migration(
+                comment
+            )
+            dirty = metadata is None or migrated
             if metadata is None:
                 metadata = ProjectMetadata(source_comment=comment or None)
         finally:
@@ -451,6 +479,7 @@ def _mixer_payload(mix: MixerMetadata) -> dict[str, Any]:
             {
                 "level_db": track.level_db,
                 "pan": track.pan,
+                "name": track.name,
                 "record_enabled": track.record_enabled,
                 "input_monitoring": track.input_monitoring,
                 "muted": track.muted,
@@ -462,20 +491,27 @@ def _mixer_payload(mix: MixerMetadata) -> dict[str, Any]:
     }
 
 
-def _mixer_from_payload(payload: object) -> MixerMetadata:
+def _mixer_from_payload(
+    payload: object, *, schema_version: int
+) -> MixerMetadata:
     if not isinstance(payload, dict):
         raise ValueError("mix must be an object")
     tracks_payload = payload["tracks"]
     if not isinstance(tracks_payload, list):
         raise ValueError("mix tracks must be an array")
     tracks: list[TrackMixMetadata] = []
-    for track_payload in tracks_payload:
+    for index, track_payload in enumerate(tracks_payload):
         if not isinstance(track_payload, dict):
             raise ValueError("mix tracks must be objects")
         tracks.append(
             TrackMixMetadata(
                 level_db=track_payload["level_db"],
                 pan=track_payload["pan"],
+                name=(
+                    default_track_name(index)
+                    if schema_version == 5
+                    else track_payload["name"]
+                ),
                 record_enabled=track_payload["record_enabled"],
                 input_monitoring=track_payload["input_monitoring"],
                 muted=track_payload["muted"],

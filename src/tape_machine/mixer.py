@@ -17,8 +17,10 @@ from tape_machine.audio import (
 from tape_machine.project import (
     MIX_MAX_LEVEL_DB,
     MIX_MIN_LEVEL_DB,
+    TRACK_NAME_MAX_LENGTH,
     MixerMetadata,
     TrackMixMetadata,
+    default_track_name,
 )
 from tape_machine.theme import (
     ACCENT_BLUE,
@@ -27,6 +29,7 @@ from tape_machine.theme import (
     ACCENT_YELLOW,
     FADER_HANDLE,
     FADER_INDICATOR,
+    FADER_READOUT,
     FADER_RAIL,
     FADER_TICK,
     KNOB_BACKGROUND,
@@ -72,6 +75,14 @@ def format_level_db(value: float) -> str:
     return f"{value:+.1f} dB"
 
 
+def normalize_track_name(track_index: int, value: str) -> str:
+    """Normalize an edited track name for display and persistence."""
+    if not isinstance(value, str):
+        raise ValueError("Track name must be text.")
+    normalized = value.strip()[:TRACK_NAME_MAX_LENGTH]
+    return normalized or default_track_name(track_index)
+
+
 def level_y(value: float) -> float:
     """Map a fader or meter dB value onto the shared vertical scale."""
     ratio = (clamp(value, MIN_LEVEL_DB, MAX_LEVEL_DB) - MIN_LEVEL_DB) / (
@@ -98,6 +109,7 @@ class TrackMixerState:
     input_monitoring: bool = False
     muted: bool = False
     soloed: bool = False
+    name: str = ""
 
 
 @dataclass(slots=True)
@@ -106,7 +118,8 @@ class MixerState:
 
     tracks: list[TrackMixerState] = field(
         default_factory=lambda: [
-            TrackMixerState() for _ in range(PROJECT_TRACK_COUNT)
+            TrackMixerState(name=default_track_name(index))
+            for index in range(PROJECT_TRACK_COUNT)
         ]
     )
     bus_level_db: float = UNITY_LEVEL_DB
@@ -132,7 +145,9 @@ class MixerState:
                 f"Mixer routing must contain {PROJECT_TRACK_COUNT} tracks."
             )
         tracks = []
-        for channel, saved in zip(track_inputs, mix.tracks, strict=True):
+        for index, (channel, saved) in enumerate(
+            zip(track_inputs, mix.tracks, strict=True)
+        ):
             input_assigned = channel is not None
             input_monitorable = is_physical_input(channel)
             tracks.append(
@@ -149,6 +164,7 @@ class MixerState:
                     ),
                     muted=saved.muted,
                     soloed=saved.soloed,
+                    name=normalize_track_name(index, saved.name),
                 )
             )
         return cls(tracks=tracks, bus_level_db=mix.bus_level_db)
@@ -185,6 +201,7 @@ class MixerState:
                     ),
                     muted=track.muted,
                     soloed=track.soloed,
+                    name=normalize_track_name(index, track.name),
                 )
             )
         return MixerMetadata(
@@ -224,6 +241,15 @@ class MixerState:
         self.tracks[track_index].pan = value
         self._notify()
         return value
+
+    def set_track_name(self, track_index: int, value: str) -> str:
+        """Commit a normalized scribble-strip name for one track."""
+        normalized = normalize_track_name(track_index, value)
+        track = self.tracks[track_index]
+        if track.name != normalized:
+            track.name = normalized
+            self._notify()
+        return normalized
 
     def toggle(self, track_index: int, control: str) -> bool:
         """Toggle a track button, respecting input-route availability."""
@@ -280,6 +306,7 @@ class VerticalFader:
         )
         self.readout = toga.Label(
             format_level_db(self.value),
+            color=FADER_READOUT,
             font_size=10,
             text_align=CENTER,
             margin_top=3,
@@ -485,6 +512,7 @@ class TrackStrip:
         self.state = mixer_state.tracks[index]
         self.monitoring_available = False
         self.record_enable_locked = False
+        self._normalizing_name = False
         self.pan = PanKnob(
             self.state.pan,
             lambda value: self.mixer_state.set_pan(self.index, value),
@@ -530,6 +558,17 @@ class TrackStrip:
             margin_top=8,
             margin_bottom=8,
         )
+        self.name_input = toga.TextInput(
+            value=self.state.name,
+            on_change=self._limit_name,
+            on_confirm=self._commit_name,
+            on_lose_focus=self._commit_name,
+            width=80,
+            height=24,
+            font_size=10,
+            margin_top=6,
+            margin_bottom=2,
+        )
         self.widget = toga.Box(
             children=[
                 toga.Label(
@@ -542,6 +581,7 @@ class TrackStrip:
                 self.pan.widget,
                 button_grid,
                 self.fader.widget,
+                self.name_input,
             ],
             direction=COLUMN,
             align_items=CENTER,
@@ -550,6 +590,31 @@ class TrackStrip:
             margin_right=4,
         )
         self.sync_controls()
+
+    def _limit_name(
+        self, widget: toga.TextInput, **kwargs: object
+    ) -> None:
+        """Keep the inline editor within the persisted character limit."""
+        if self._normalizing_name or len(widget.value) <= TRACK_NAME_MAX_LENGTH:
+            return
+        self._set_name_value(widget, widget.value[:TRACK_NAME_MAX_LENGTH])
+
+    def _commit_name(
+        self, widget: toga.TextInput, **kwargs: object
+    ) -> None:
+        """Commit an edit on Return or when the scribble strip loses focus."""
+        if self._normalizing_name:
+            return
+        normalized = self.mixer_state.set_track_name(self.index, widget.value)
+        if widget.value != normalized:
+            self._set_name_value(widget, normalized)
+
+    def _set_name_value(self, widget: toga.TextInput, value: str) -> None:
+        self._normalizing_name = True
+        try:
+            widget.value = value
+        finally:
+            self._normalizing_name = False
 
     def _toggle_handler(
         self, control: str

@@ -356,6 +356,7 @@ def test_mixer_change_rebuilds_running_engine_matrix() -> None:
     routes = (None, None, 2, None, None, None, None, None)
     state = MixerState.from_track_inputs(routes)
     state.tracks[2].record_enabled = True
+    state.tracks[2].name = "Harmony"
     project = FakeProject()
     app = SimpleNamespace(
         mixer_state=state,
@@ -380,6 +381,7 @@ def test_mixer_change_rebuilds_running_engine_matrix() -> None:
     assert arm_calls == [(False, False, True, False, False, False, False, False)]
     assert project.dirty is True
     assert project.staged[-1].mix.tracks[2].record_enabled is True
+    assert project.staged[-1].mix.tracks[2].name == "Harmony"
 
 
 def test_meter_sync_distributes_the_latest_engine_snapshot() -> None:
