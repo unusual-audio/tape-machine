@@ -16,6 +16,19 @@ from tape_machine.project import (
     MixerMetadata,
     TrackMixMetadata,
 )
+from tape_machine.theme import (
+    ACCENT_BLUE,
+    ACCENT_ORANGE,
+    ACCENT_RED,
+    ACCENT_YELLOW,
+    FADER_HANDLE,
+    FADER_INDICATOR,
+    FADER_RAIL,
+    FADER_TICK,
+    KNOB_BACKGROUND,
+    KNOB_BORDER,
+    KNOB_INDICATOR,
+)
 
 
 MIN_LEVEL_DB = MIX_MIN_LEVEL_DB
@@ -28,10 +41,10 @@ _FADER_TOP = 12
 _FADER_BOTTOM = 214
 
 _CONTROL_COLORS = {
-    "record_enabled": "#d94b4b",
-    "input_monitoring": "#4b8fd9",
-    "muted": "#d98b3e",
-    "soloed": "#e0bd35",
+    "record_enabled": ACCENT_RED,
+    "input_monitoring": ACCENT_BLUE,
+    "muted": ACCENT_ORANGE,
+    "soloed": ACCENT_YELLOW,
 }
 
 
@@ -269,7 +282,7 @@ class VerticalFader:
     def _draw(self, widget: toga.Canvas, **kwargs: object) -> None:
         clear_canvas(widget)
         center_x = 24
-        with widget.stroke(color="#777777", line_width=3):
+        with widget.stroke(color=FADER_RAIL, line_width=3):
             widget.begin_path()
             widget.move_to(center_x, _FADER_TOP)
             widget.line_to(center_x, _FADER_BOTTOM)
@@ -279,7 +292,7 @@ class VerticalFader:
             tick_y = _FADER_BOTTOM - ratio * (
                 _FADER_BOTTOM - _FADER_TOP
             )
-            with widget.stroke(color="#999999", line_width=1):
+            with widget.stroke(color=FADER_TICK, line_width=1):
                 widget.begin_path()
                 widget.move_to(7, tick_y)
                 widget.line_to(14, tick_y)
@@ -288,9 +301,9 @@ class VerticalFader:
 
         ratio = (self.value - MIN_LEVEL_DB) / (MAX_LEVEL_DB - MIN_LEVEL_DB)
         handle_y = _FADER_BOTTOM - ratio * (_FADER_BOTTOM - _FADER_TOP)
-        with widget.fill(color="#d6d6d6"):
+        with widget.fill(color=FADER_HANDLE):
             widget.rect(5, handle_y - 8, 38, 16)
-        with widget.stroke(color="#404040", line_width=2):
+        with widget.stroke(color=FADER_INDICATOR, line_width=2):
             widget.begin_path()
             widget.move_to(6, handle_y)
             widget.line_to(42, handle_y)
@@ -365,13 +378,13 @@ class PanKnob:
         center_x = 28
         center_y = 27
         radius = 18
-        with widget.fill(color="#f0f0f0"):
+        with widget.fill(color=KNOB_BACKGROUND):
             widget.arc(center_x, center_y, radius)
-        with widget.stroke(color="#a9a9a9", line_width=2):
+        with widget.stroke(color=KNOB_BORDER, line_width=2):
             widget.arc(center_x, center_y, radius)
 
         angle = (-pi / 2) + self.value * (3 * pi / 4)
-        with widget.stroke(color="#303030", line_width=3):
+        with widget.stroke(color=KNOB_INDICATOR, line_width=3):
             widget.begin_path()
             widget.move_to(center_x, center_y)
             widget.line_to(

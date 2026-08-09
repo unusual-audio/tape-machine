@@ -5,8 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 import toga
-from toga.constants import Baseline
-from toga.style.pack import CENTER, COLUMN, ROW, SYSTEM
+from toga.style.pack import CENTER, COLUMN, ROW
 
 from tape_machine.audio import (
     AudioConfigurationError,
@@ -17,6 +16,11 @@ from tape_machine.engine import AudioEngine, AudioEngineError
 from tape_machine.mixer import MixerState, MixerView
 from tape_machine.project import AudioProject, ProjectError, ProjectMetadata
 from tape_machine.settings import AudioSettingsDraft, AudioSettingsWindow
+from tape_machine.theme import (
+    ACCENT_BLUE,
+    ACCENT_RED,
+    force_dark_appearance,
+)
 from tape_machine.transport import (
     TransportController,
     TransportError,
@@ -25,8 +29,21 @@ from tape_machine.transport import (
 )
 
 
+_TRANSPORT_BUTTON_WIDTH = 80
+_RECORD_BUTTON_TEXT = "● REC"
+_REWIND_BUTTON_TEXT = "◀◀ REW"
+_PLAY_BUTTON_TEXT = "▶ PLAY"
+_RTZ_BUTTON_TEXT = "⇤ RTZ"
+_STOP_BUTTON_TEXT = "■ STOP"
+_FAST_FORWARD_BUTTON_TEXT = "▶▶ FWD"
+
+
 class ShuttleButton:
-    """Canvas-backed transport button with distinct press and release events."""
+    """Native transport button with distinct press and release events."""
+
+    _MOUSE_DOWN_EVENT = 1
+    _MOUSE_UP_EVENT = 2
+    _MOUSE_EVENT_MASK = (1 << _MOUSE_DOWN_EVENT) | (1 << _MOUSE_UP_EVENT)
 
     def __init__(
         self,
@@ -44,15 +61,13 @@ class ShuttleButton:
         self._enabled = True
         self._active = False
         self._pointer_down = False
-        self._font = toga.Font(family=SYSTEM, size=11)
-        self.widget = toga.Canvas(
+        self.widget = toga.Button(
+            text,
+            on_press=self._native_event,
             width=width,
             height=self.height,
-            on_resize=self._draw,
-            on_press=self._press,
-            on_release=self._release,
         )
-        self._draw(self.widget)
+        self.widget._impl.native.sendActionOn(self._MOUSE_EVENT_MASK)
 
     @property
     def enabled(self) -> bool:
@@ -62,7 +77,11 @@ class ShuttleButton:
     def enabled(self, enabled: bool) -> None:
         if self._enabled != enabled:
             self._enabled = enabled
-            self._draw(self.widget)
+            # Keep the native control tracking until mouse-up so a momentary
+            # shuttle always receives its release, even if transport state
+            # temporarily disables the button while it is held.
+            if not self._pointer_down:
+                self.widget.enabled = enabled
 
     @property
     def active(self) -> bool:
@@ -72,51 +91,34 @@ class ShuttleButton:
     def active(self, active: bool) -> None:
         if self._active != active:
             self._active = active
-            self._draw(self.widget)
+            if active:
+                self.widget.style.background_color = ACCENT_BLUE
+            else:
+                del self.widget.style.background_color
 
-    def _press(
-        self, widget: toga.Canvas, x: int, y: int, **kwargs: object
-    ) -> None:
+    def _native_event(self, widget: toga.Button, **kwargs: object) -> None:
+        event_type = int(widget._impl.native.window.currentEvent().type)
+        if event_type == self._MOUSE_DOWN_EVENT:
+            self._press(widget)
+        elif event_type == self._MOUSE_UP_EVENT:
+            self._release(widget)
+        else:
+            # Keyboard and accessibility activation behaves like a click.
+            self._press(widget)
+            self._release(widget)
+
+    def _press(self, widget: toga.Button, **kwargs: object) -> None:
         if not self._enabled:
             return
         self._pointer_down = True
-        self._draw(widget)
         self.on_press()
 
-    def _release(
-        self, widget: toga.Canvas, x: int, y: int, **kwargs: object
-    ) -> None:
+    def _release(self, widget: toga.Button, **kwargs: object) -> None:
         if not self._pointer_down:
             return
         self._pointer_down = False
-        self._draw(widget)
         self.on_release()
-
-    def _draw(self, widget: toga.Canvas, **kwargs: object) -> None:
-        widget.root_state.drawing_actions.clear()
-        if self._active or self._pointer_down:
-            background = "#4b8fd9"
-            foreground = "#ffffff"
-        elif self._enabled:
-            background = "#ececec"
-            foreground = "#202020"
-        else:
-            background = "#d8d8d8"
-            foreground = "#888888"
-        with widget.fill(color=background):
-            widget.round_rect(0.5, 0.5, self.width - 1, self.height - 1, 4)
-        with widget.stroke(color="#999999", line_width=1):
-            widget.round_rect(0.5, 0.5, self.width - 1, self.height - 1, 4)
-        text_width, _ = widget.measure_text(self.text, self._font)
-        with widget.fill(color=foreground):
-            widget.fill_text(
-                self.text,
-                (self.width - text_width) / 2,
-                self.height / 2,
-                font=self._font,
-                baseline=Baseline.MIDDLE,
-            )
-        widget.redraw()
+        self.widget.enabled = self._enabled
 
 
 class TapeMachine(toga.App):
@@ -124,6 +126,7 @@ class TapeMachine(toga.App):
 
     def startup(self) -> None:
         """Create and show the main application window."""
+        force_dark_appearance(self._impl.native)
         self.audio_service = AudioDeviceService()
         self.audio_engine = AudioEngine()
         try:
@@ -247,37 +250,37 @@ class TapeMachine(toga.App):
         self.transport = TransportController(project)
         self.audio_engine.set_transport(self.transport)
         self.transport_record_button = toga.Button(
-            "Record",
+            _RECORD_BUTTON_TEXT,
             on_press=self._toggle_transport_record,
-            width=80,
+            width=_TRANSPORT_BUTTON_WIDTH,
             height=28,
         )
         self.transport_play_button = toga.Button(
-            "Play",
+            _PLAY_BUTTON_TEXT,
             on_press=self._play_transport,
-            width=60,
+            width=_TRANSPORT_BUTTON_WIDTH,
             height=28,
         )
         self.transport_rewind_button = ShuttleButton(
-            "Rewind",
+            _REWIND_BUTTON_TEXT,
             on_press=lambda: self._shuttle_pressed(TransportMode.REWIND),
             on_release=lambda: self._shuttle_released(TransportMode.REWIND),
-            width=72,
+            width=_TRANSPORT_BUTTON_WIDTH,
         )
         self.transport_fast_forward_button = ShuttleButton(
-            "Fast Forward",
+            _FAST_FORWARD_BUTTON_TEXT,
             on_press=lambda: self._shuttle_pressed(
                 TransportMode.FAST_FORWARD
             ),
             on_release=lambda: self._shuttle_released(
                 TransportMode.FAST_FORWARD
             ),
-            width=96,
+            width=_TRANSPORT_BUTTON_WIDTH,
         )
         self.transport_stop_rtz_button = toga.Button(
-            "RTZ",
+            _RTZ_BUTTON_TEXT,
             on_press=self._stop_or_rtz,
-            width=60,
+            width=_TRANSPORT_BUTTON_WIDTH,
             height=28,
         )
         self.transport_time_label = toga.Label(
@@ -767,11 +770,10 @@ class TapeMachine(toga.App):
             and not momentary_shuttle_active
             and bool(self.project and self.project.writable)
         )
+        self.transport_record_button.text = _RECORD_BUTTON_TEXT
         if self.transport.record_armed:
-            self.transport_record_button.text = "● Record"
-            self.transport_record_button.style.background_color = "#d94b4b"
+            self.transport_record_button.style.background_color = ACCENT_RED
         else:
-            self.transport_record_button.text = "Record"
             del self.transport_record_button.style.background_color
         self.transport_play_button.enabled = (
             engine_available
@@ -812,7 +814,9 @@ class TapeMachine(toga.App):
             mode is TransportMode.FAST_FORWARD
         )
         self.transport_stop_rtz_button.text = (
-            "Stop" if rolling or momentary_shuttle_active else "RTZ"
+            _STOP_BUTTON_TEXT
+            if rolling or momentary_shuttle_active
+            else _RTZ_BUTTON_TEXT
         )
         self.transport_stop_rtz_button.enabled = (
             not busy

@@ -479,11 +479,11 @@ def test_transport_controls_show_toggle_stop_and_time_state() -> None:
     TapeMachine._sync_transport_controls(app)
 
     assert app.transport_record_button.enabled is True
-    assert app.transport_record_button.text == "● Record"
+    assert app.transport_record_button.text == "● REC"
     assert app.transport_play_button.enabled is False
     assert app.transport_rewind_button.enabled is False
     assert app.transport_fast_forward_button.enabled is False
-    assert app.transport_stop_rtz_button.text == "Stop"
+    assert app.transport_stop_rtz_button.text == "■ STOP"
     assert app.transport_stop_rtz_button.enabled is True
     assert app.transport_time_label.text == "00:01.250"
 
@@ -527,7 +527,7 @@ def test_transport_controls_show_active_fast_forward_state() -> None:
     assert app.transport_fast_forward_button.enabled is True
     assert app.transport_fast_forward_button.active is True
     assert app.transport_rewind_button.active is False
-    assert app.transport_stop_rtz_button.text == "Stop"
+    assert app.transport_stop_rtz_button.text == "■ STOP"
     assert app.transport_time_label.text == "00:01.250"
 
 
@@ -704,8 +704,23 @@ def test_momentary_shuttle_resumes_playback_on_release() -> None:
     assert transport.mode is TransportMode.PLAYING
 
 
-def test_shuttle_button_delivers_release_after_becoming_disabled() -> None:
+def test_shuttle_button_uses_native_button_mouse_events(monkeypatch) -> None:
     events: list[str] = []
+    current_event = SimpleNamespace(type=ShuttleButton._MOUSE_DOWN_EVENT)
+    native = SimpleNamespace(
+        window=SimpleNamespace(currentEvent=lambda: current_event),
+        sendActionOn=lambda mask: events.append(f"mask:{mask}"),
+    )
+
+    class FakeButton:
+        def __init__(self, text, on_press, width, height) -> None:
+            self.text = text
+            self.on_press = on_press
+            self.style = SimpleNamespace(background_color=None)
+            self.enabled = True
+            self._impl = SimpleNamespace(native=native)
+
+    monkeypatch.setattr("tape_machine.app.toga.Button", FakeButton)
     button = ShuttleButton(
         "Rewind",
         lambda: events.append("press"),
@@ -713,8 +728,29 @@ def test_shuttle_button_delivers_release_after_becoming_disabled() -> None:
         width=72,
     )
 
-    button._press(button.widget, 1, 1)
+    button.widget.on_press(button.widget)
+    current_event.type = ShuttleButton._MOUSE_UP_EVENT
+    button.widget.on_press(button.widget)
+
+    assert events == [f"mask:{ShuttleButton._MOUSE_EVENT_MASK}", "press", "release"]
+    assert button.widget.text == "Rewind"
+
+
+def test_shuttle_button_delivers_release_after_becoming_disabled() -> None:
+    events: list[str] = []
+    button = ShuttleButton.__new__(ShuttleButton)
+    button.on_press = lambda: events.append("press")
+    button.on_release = lambda: events.append("release")
+    button._enabled = True
+    button._pointer_down = False
+    button.widget = SimpleNamespace(
+        enabled=True,
+        style=SimpleNamespace(background_color=None),
+    )
+
+    button._press(button.widget)
     button.enabled = False
-    button._release(button.widget, 1, 1)
+    button._release(button.widget)
 
     assert events == ["press", "release"]
+    assert button.widget.enabled is False
