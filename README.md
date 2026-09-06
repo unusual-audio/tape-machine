@@ -1,5 +1,7 @@
 # Tape Machine
 
+Please note: this project is just a bit of fun, it's not maintained.
+
 <img alt="Screenshot" src="https://github.com/user-attachments/assets/41ff8f0d-c73b-4aa6-90d0-67954d055619" />
 
 A standalone macOS application built with [BeeWare Toga](https://toga.beeware.org/)
